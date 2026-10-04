@@ -23,6 +23,7 @@ RUN_AUTOREMOVE=0
 CONFIGURE_DNS=1
 STATE_DIR=""
 TX_SERVICE=""
+TX_RECOVERY_INCOMPLETE=0
 BACKUP_DIR=""
 TX_FILES=()
 
@@ -232,8 +233,13 @@ rollback_transaction() {
         return 1
       fi
       ;;
-    systemd-resolved) systemctl restart systemd-resolved || warn "Could not restart restored DNS" ;;
-    fail2ban) systemctl restart fail2ban || warn "Could not restart restored fail2ban" ;;
+    systemd-resolved|fail2ban)
+      if ! systemctl restart "$service"; then
+        TX_RECOVERY_INCOMPLETE=1
+        warn "Rollback incomplete: could not restart restored $service; recovery files retained in $STATE_DIR"
+        return 1
+      fi
+      ;;
     apt-timers) restore_apt_units || return 1 ;;
   esac
   commit_transaction
@@ -245,7 +251,7 @@ finish() {
   trap - EXIT
   cleanup_ipv6_guard || rc=1
   if [[ -n "$TX_SERVICE" ]]; then
-    if ! rollback_transaction; then
+    if (( TX_RECOVERY_INCOMPLETE )) || ! rollback_transaction; then
       printf 'Rollback incomplete. Recovery files retained in %s\n' "$STATE_DIR" >&2
       exit 1
     fi
@@ -298,6 +304,9 @@ export PATH=/usr/sbin:/usr/bin:/sbin:/bin
 URL='https://sshid.io/proms/ECDSA-SK?source=authorized-keys'
 SSHID_BEGIN='# BEGIN SSH ID @proms - managed by update-sshid-proms'
 SSHID_END='# END SSH ID @proms - managed by update-sshid-proms'
+PERSONAL_BEGIN='# BEGIN PERSONAL ED25519 @proms - managed by update-sshid-proms'
+PERSONAL_END='# END PERSONAL ED25519 @proms - managed by update-sshid-proms'
+PERSONAL_KEY='ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIJGo1Ilji90jrWIey6gCWky17w4h+37uj66/ltDlaQsx'
 STATIC_BEGIN='# BEGIN LUMA YUBIKEY @proms - managed by update-sshid-proms'
 STATIC_END='# END LUMA YUBIKEY @proms - managed by update-sshid-proms'
 STATIC_KEY_1='sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAICT1pndCo1Fuowwt7I668hgEqeNqmtg9b4QXM6YNlL99AAAABHNzaDo= YubiKey Security Key SSH'
@@ -341,6 +350,8 @@ validate_key() {
   ssh-keygen -lf "$WORK/one" >/dev/null 2>&1 || die 'OpenSSH rejected a public key (material omitted)'
   printf '%s\n' "$id"
 }
+personal_id=$(validate_key "$PERSONAL_KEY")
+printf '%s\n' "$personal_id" > "$WORK/personal"
 : > "$WORK/static"
 for key in "$STATIC_KEY_1" "$STATIC_KEY_2"; do
   id=$(validate_key "$key")
@@ -364,14 +375,19 @@ done < "$WORK/lines"
 [[ -s "$WORK/dynamic" ]] || die 'SSH ID returned no valid keys; authorized_keys unchanged'
 {
   printf '%s\n' "$SSHID_BEGIN"
-  cat "$WORK/dynamic"
-  printf '%s\n\n%s\n' "$SSHID_END" "$STATIC_BEGIN"
+  while IFS= read -r id; do
+    [[ "$id" == "$personal_id" ]] || printf '%s\n' "$id"
+  done < "$WORK/dynamic"
+  printf '%s\n\n%s\n' "$SSHID_END" "$PERSONAL_BEGIN"
+  cat "$WORK/personal"
+  printf '%s\n\n%s\n' "$PERSONAL_END" "$STATIC_BEGIN"
   while IFS= read -r id; do
     grep -Fqx -- "$id" "$WORK/dynamic" || printf '%s\n' "$id"
   done < "$WORK/static"
   printf '%s\n' "$STATIC_END"
 } > "$WORK/new"
-# Verify the final assembled set, including both mandatory static identities.
+# Verify the final assembled set, including all mandatory managed identities.
+grep -Fqx -- "$personal_id" "$WORK/new" || die 'Required PERSONAL ED25519 identity missing from assembled keys'
 while IFS= read -r id; do
   grep -Fqx -- "$id" "$WORK/new" || die 'Required FIDO2 identity missing from assembled keys'
 done < "$WORK/static"
@@ -840,6 +856,10 @@ apply_ssh_runtime_config() {
   # Authentication-only changes: preserve the existing listener architecture.
   # Port/ListenAddress changes would need separate socket/generator handling.
   if systemctl is-active --quiet ssh.socket; then
+    if systemctl is-active --quiet ssh.service; then
+      systemctl reload ssh.service || return 1
+      systemctl is-active --quiet ssh.service || return 1
+    fi
     detect_ssh_ports || return 1
     systemctl is-active --quiet ssh.socket || return 1
   elif systemctl is-active --quiet ssh.service; then
@@ -1529,14 +1549,7 @@ usedns = no
 
 
 [recidive]
-enabled = true
-ignoreip = ${IGNORE_IPS}
-logpath = /var/log/fail2ban.log
-backend = auto
-banaction = nftables[type=allports]
-findtime = 90d
-bantime = 26w
-maxretry = 2
+enabled = false
 EOF
 
   if fail2ban-server -t; then
@@ -1554,12 +1567,20 @@ EOF
     return 0
   fi
 
-  if fail2ban-client status sshd >/dev/null 2>&1 && fail2ban-client status recidive >/dev/null 2>&1; then
+  # A legacy jail may survive reload; stop only that jail, preserving all others.
+  if fail2ban-client status recidive >/dev/null 2>&1; then
+    if ! fail2ban-client stop recidive; then
+      rollback_transaction
+      fail_check "Could not stop legacy recidive jail; previous files restored"
+      return 0
+    fi
+  fi
+  if fail2ban-client status sshd >/dev/null 2>&1 && ! fail2ban-client status recidive >/dev/null 2>&1; then
     commit_transaction
-    pass_check "fail2ban sshd and recidive jails are active"
+    pass_check "fail2ban sshd jail is active; recidive is disabled"
   else
     rollback_transaction
-    fail_check "fail2ban jail not active; previous files restored"
+    fail_check "fail2ban sshd inactive or recidive still active; previous files restored"
   fi
 }
 
@@ -1622,7 +1643,6 @@ final_report() {
   echo
   echo "fail2ban status:"
   fail2ban-client status sshd 2>/dev/null | sed 's/^/  /' || true
-  fail2ban-client status recidive 2>/dev/null | sed 's/^/  /' || true
 
   echo
   echo "Passed checks:"
