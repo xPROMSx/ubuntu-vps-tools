@@ -36,7 +36,10 @@ CURRENT_SSH_PORT=""
 SSH_CONTEXTS=()
 SSH_AUTHORITY_CONTEXTS=()
 SSH_AUTHORITY_FINDINGS=()
+SSH_AUTHORITY_FINDING_KEYS=()
+SSH_AUTHORITY_FINDING_CONTEXTS=()
 SSH_AUTHORITY_NOTICE=""
+SSH_AUTHORITY_SOURCE_LIMITATION=""
 UFW_GUARD=""
 BOOTSTRAP_IPV4=not-tested
 PROVIDER_IPV6=not-tested
@@ -830,27 +833,46 @@ ssh_policy_ok() {
 
 # Standard paths only: source locations aid investigation, never prove policy.
 ssh_authority_sources() {
-  local file
+  local file rc=0
   for file in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
-    [[ ! -f "$file" || ! -r "$file" ]] || printf '%s\n' "$file"
+    [[ -f "$file" ]] || continue
+    if [[ -r "$file" ]]; then
+      printf '%s\n' "$file" || return 1
+    else
+      rc=1
+    fi
   done
+  return "$rc"
 }
 
 ssh_authority_source_lines() {
-  local directive="$1" file
+  local directive="$1" file files
+  files="$(ssh_authority_sources)" || return 1
+  [[ -n "$files" ]] || return 0
   while IFS= read -r file; do
     awk -v directive="$directive" 'tolower($1) == directive {
       print FILENAME ":" FNR ":" $0
-    }' "$file"
-  done < <(ssh_authority_sources)
+    }' "$file" || return 1
+  done <<< "$files"
 }
 
 ssh_authority_finding() {
-  local directive="$1" value="$2" context="$3" meaning="$4" details="${5:-}" sources command='sshd -T'
+  local directive="$1" value="$2" context="$3" meaning="$4" details="${5:-}" sources command='sshd -T' identity i
+  identity="$directive"$'\034'"$value"$'\034'"$details"
+  for i in "${!SSH_AUTHORITY_FINDING_KEYS[@]}"; do
+    if [[ "${SSH_AUTHORITY_FINDING_KEYS[$i]}" == "$identity" ]]; then
+      SSH_AUTHORITY_FINDING_CONTEXTS[$i]+=$'\n'"  - $context"
+      return 0
+    fi
+  done
+  SSH_AUTHORITY_FINDING_KEYS+=("$identity")
+  SSH_AUTHORITY_FINDING_CONTEXTS+=("  - $context")
   [[ "$context" == base ]] || command="sshd -T -C '$context'"
-  sources="$(ssh_authority_source_lines "$directive")"
+  if ! sources="$(ssh_authority_source_lines "$directive")"; then
+    sources='effective value confirmed by sshd -T; source lookup unavailable in standard /etc/ssh paths'
+  fi
   [[ -n "$sources" ]] || sources='effective value confirmed by sshd -T; source not located in standard /etc/ssh paths'
-  SSH_AUTHORITY_FINDINGS+=("Effective root SSH configuration ($context):
+  SSH_AUTHORITY_FINDINGS+=("Effective root SSH configuration:
   $directive $value
 ${details}Meaning:
   $meaning
@@ -858,6 +880,7 @@ Source location (investigation hints, not policy evidence):
 $sources
 Where to investigate:
   $command | grep -i $directive
+  sshd -T -C '<tested root -C context listed above>' | grep -i $directive
   grep -ni $directive /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf")
   warn "Additional effective root SSH authority detected: $directive $value ($context)"
 }
@@ -897,26 +920,37 @@ ssh_authority_audit_context() {
 }
 
 ssh_authority_match_notice() {
-  local file
+  local file sources
   local -a files=()
-  while IFS= read -r file; do files+=("$file"); done < <(ssh_authority_sources)
-  [[ ${#files[@]} -gt 0 ]] || return 0
-  # Conservative co-occurrence only; do not parse Include/Match grammar.
-  SSH_AUTHORITY_NOTICE="$(awk '
+  SSH_AUTHORITY_NOTICE=""
+  SSH_AUTHORITY_SOURCE_LIMITATION=""
+  if ! sources="$(ssh_authority_sources)"; then
+    SSH_AUTHORITY_SOURCE_LIMITATION='Conditional source scan unavailable; effective authority audit is unaffected.'
+    return 0
+  fi
+  [[ -n "$sources" ]] || return 0
+  while IFS= read -r file; do files+=("$file"); done <<< "$sources"
+  # Same-file ordering only; do not parse Include/Match grammar.
+  if ! SSH_AUTHORITY_NOTICE="$(awk '
+    FNR == 1 { conditional=0 }
     tolower($1) == "match" { conditional=1 }
-    (tolower($1) == "authorizedkeyscommand" || tolower($1) == "trustedusercakeys") && tolower($2) != "none" {
-      lines=lines FILENAME ":" FNR ":" $0 "\n"
+    conditional && (tolower($1) == "authorizedkeyscommand" || tolower($1) == "trustedusercakeys") && tolower($2) != "none" {
+      print FILENAME ":" FNR ":" $0
     }
-    (tolower($1) == "hostbasedauthentication" || tolower($1) == "gssapiauthentication") && tolower($2) == "yes" {
-      lines=lines FILENAME ":" FNR ":" $0 "\n"
+    conditional && (tolower($1) == "hostbasedauthentication" || tolower($1) == "gssapiauthentication") && tolower($2) == "yes" {
+      print FILENAME ":" FNR ":" $0
     }
-    END { if (conditional && lines != "") printf "%s", lines }
-  ' "${files[@]}")"
+  ' "${files[@]}")"; then
+    SSH_AUTHORITY_NOTICE=""
+    SSH_AUTHORITY_SOURCE_LIMITATION='Conditional source scan unavailable; effective authority audit is unaffected.'
+  fi
+  return 0
 }
 
 ssh_authority_report() {
   echo 'SSH authority audit:'
   echo '  Managed AuthorizedKeysFile: .ssh/authorized_keys'
+  [[ -z "$SSH_AUTHORITY_SOURCE_LIMITATION" ]] || printf '  Diagnostic limitation: %s\n' "$SSH_AUTHORITY_SOURCE_LIMITATION"
   printf '  Tested root contexts: %s\n' "${SSH_AUTHORITY_CONTEXTS[@]}"
   if [[ ${#SSH_AUTHORITY_FINDINGS[@]} -eq 0 ]]; then
     echo '  Additional effective root SSH authorization sources: none detected'
@@ -924,7 +958,7 @@ ssh_authority_report() {
       echo '  Effective tested root contexts: clean'
       echo '  NOTICE: conditional security-sensitive SSH configuration detected'
       printf '%s\n' "$SSH_AUTHORITY_NOTICE"
-      echo '  Sensitive directives and Match coexist in standard sources; block membership is not parsed.'
+      echo '  Sensitive directives follow Match in the same source file; Include/Match grammar is not fully parsed.'
       echo '  No additional path is active in tested root contexts; another source/destination/host context may evaluate differently.'
       echo '  Bootstrap action: no changes made to these mechanisms.'
       echo '  Review manually if this server accepts SSH from other networks/addresses.'
@@ -935,11 +969,16 @@ ssh_authority_report() {
 }
 
 ssh_authority_security_report() {
+  local i
   [[ ${#SSH_AUTHORITY_FINDINGS[@]} -gt 0 ]] || return 0
   echo '================================================================'
   echo 'SECURITY WARNING: ADDITIONAL ROOT SSH AUTHORITY DETECTED'
   echo '================================================================'
-  printf '%s\n\n' "${SSH_AUTHORITY_FINDINGS[@]}"
+  for i in "${!SSH_AUTHORITY_FINDINGS[@]}"; do
+    echo 'Observed in tested root contexts:'
+    printf '%s\n' "${SSH_AUTHORITY_FINDING_CONTEXTS[$i]}"
+    printf '%s\n\n' "${SSH_AUTHORITY_FINDINGS[$i]}"
+  done
   echo 'Bootstrap did NOT disable or modify these mechanisms.'
   echo 'Review them before treating root SSH access as exclusive to the managed Proms authorized_keys.'
   echo '================================================================'
