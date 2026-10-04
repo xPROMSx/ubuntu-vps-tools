@@ -27,6 +27,8 @@ TX_RECOVERY_INCOMPLETE=0
 BACKUP_DIR=""
 TX_FILES=()
 
+declare -A SUMMARY_STATE=() SUMMARY_DETAIL=()
+
 WARNINGS=()
 FAILED_CHECKS=()
 PASSED_CHECKS=()
@@ -295,6 +297,7 @@ check_os() {
     *) die "Unsupported Ubuntu release or inconsistent os-release: VERSION_ID=${VERSION_ID:-missing}, VERSION_CODENAME=${VERSION_CODENAME:-missing}; expected 24.04/noble or 26.04/resolute" ;;
   esac
   pass_check "OS: ${PRETTY_NAME:-Ubuntu}, version=$VERSION_ID, codename=$VERSION_CODENAME"
+  summary_set os ok "${PRETTY_NAME:-Ubuntu}"
 }
 
 # Emit one standalone implementation: bootstrap and future updates use this file.
@@ -490,6 +493,7 @@ check_root_authorized_keys() {
   flock -u 8
   exec 8>&-
   pass_check "Validated $valid unrestricted SSH keys; managed sections preserved"
+  summary_set keys ok "$valid managed keys validated"
 }
 
 apt_update() {
@@ -691,6 +695,7 @@ configure_ubuntu_pro() {
   if ! status="$(pro status --all --format json)" ||
      ! attached="$(pro_field attached <<< "$status")"; then
     fail_check "Cannot read Ubuntu Pro status; no attachment changes made"
+    summary_set pro fail "Cannot read Ubuntu Pro status"
     return 0
   fi
   if [[ "$attached" != true ]]; then
@@ -700,6 +705,7 @@ configure_ubuntu_pro() {
     fi
     if [[ -z "$token" ]]; then
       warn "No Ubuntu Pro token provided; Pro services skipped"
+      summary_set pro warn "not attached (optional)"
       return 0
     fi
     # JSON is valid YAML; keep the token out of command arguments and logs.
@@ -708,6 +714,7 @@ configure_ubuntu_pro() {
       rm -f "$STATE_DIR/pro-attach.yaml"
       unset token
       fail_check "Ubuntu Pro attachment failed; inspect pro status"
+      summary_set pro fail "Ubuntu Pro attachment failed"
       return 0
     fi
     rm -f "$STATE_DIR/pro-attach.yaml"
@@ -716,18 +723,22 @@ configure_ubuntu_pro() {
   if ! status="$(pro status --all --format json)" ||
      [[ "$(pro_field attached <<< "$status")" != true ]]; then
     fail_check "Ubuntu Pro attachment could not be confirmed"
+    summary_set pro fail "Ubuntu Pro attachment could not be confirmed"
     return 0
   fi
   pass_check "Ubuntu Pro attached"
+  summary_set pro ok "attached"
   for service in esm-infra esm-apps livepatch; do
     state="$(pro_field "$service" <<< "$status")"
     if [[ "$state" == disabled ]]; then
       if ! pro enable --assume-yes "$service"; then
         fail_check "Failed to enable $service"
+        summary_set pro fail "Failed to enable $service"
         continue
       fi
       if ! status="$(pro status --all --format json)"; then
         fail_check "Cannot verify $service after enable"
+        summary_set pro fail "Cannot verify $service after enable"
         return 0
       fi
       state="$(pro_field "$service" <<< "$status")"
@@ -735,17 +746,19 @@ configure_ubuntu_pro() {
     case "$state" in
       enabled) pass_check "Ubuntu Pro $service enabled" ;;
       n/a|unavailable|inapplicable|-)
-        warn "Ubuntu Pro $service unavailable for this machine/subscription ($state); inspect pro status --all" ;;
-      *) fail_check "Ubuntu Pro $service is not enabled ($state)" ;;
+        warn "Ubuntu Pro $service unavailable for this machine/subscription ($state); inspect pro status --all"; summary_set pro warn "attached; $service unavailable ($state)" ;;
+      *) fail_check "Ubuntu Pro $service is not enabled ($state)"; summary_set pro fail "Ubuntu Pro $service is not enabled ($state)" ;;
     esac
   done
   if [[ "$(pro_field livepatch <<< "$status")" == enabled ]]; then
     if [[ -x /snap/bin/canonical-livepatch ]]; then
       if ! /snap/bin/canonical-livepatch status --verbose; then
         fail_check "Livepatch client health check failed"
+        summary_set pro fail "Livepatch client health check failed"
       fi
     else
       warn "Pro reports Livepatch enabled but its client was not found"
+      summary_set pro warn "attached; Livepatch client not found"
     fi
   fi
 }
@@ -788,6 +801,8 @@ full_upgrade_and_cleanup() {
 
   if [[ "$RUN_UPGRADE" -ne 1 ]]; then
     warn "Initial full-upgrade and cleanup were skipped by --no-upgrade"
+    summary_set upgrade warn "skipped by --no-upgrade"
+    summary_set autoremove warn "skipped with --no-upgrade"
     return 0
   fi
 
@@ -802,12 +817,15 @@ full_upgrade_and_cleanup() {
 
   if [[ "$RUN_AUTOREMOVE" -eq 1 ]]; then
     apt-get -o DPkg::Lock::Timeout=600 -y autoremove --purge
+    summary_set autoremove ok "completed"
   else
     warn "Automatic package removal skipped; use --autoremove only after reviewing apt-get -s autoremove"
+    summary_set autoremove warn "skipped by design"
   fi
   apt-get -o DPkg::Lock::Timeout=600 -y autoclean
 
   pass_check "Full upgrade and autoclean completed"
+  summary_set upgrade ok "upgrade and cleanup completed"
 }
 
 ssh_policy_ok() {
@@ -1089,11 +1107,12 @@ EOF
   commit_transaction
   ssh_authority_match_notice
   pass_check "SSH syntax, effective root key-only policy and active listener verified"
+  summary_set policy ok "root key-only authentication active"
   warn "A local key check cannot prove remote login. Test a second session with both SSH ID and YubiKey before closing this one; other Match contexts may differ"
 }
 
 configure_resolved() {
-  [[ "$CONFIGURE_DNS" -eq 1 ]] || { warn "DNS changes skipped"; return 0; }
+  [[ "$CONFIGURE_DNS" -eq 1 ]] || { warn "DNS changes skipped"; summary_set dns warn "skipped by --skip-dns"; return 0; }
   log "Configure global DNS-over-TLS with rollback on resolution failure"
   # The old one-shot erased link domains and was undone by DHCP renewal.
   # Do not erase VPN/private DNS routes or restart the network manager.
@@ -1128,10 +1147,12 @@ EOF
      timeout 30 getent ahosts ubuntu.com >/dev/null; then
     commit_transaction
     pass_check "Uncached resolver and system DNS tests succeeded"
+    summary_set dns ok "DNS-over-TLS resolution validated"
     warn "Global DoT does not override more-specific link/VPN DNS routes; inspect resolvectl status. A link with ~. can also handle public queries"
   else
     rollback_transaction
     fail_check "DNS tests failed; previous resolver files restored (DoT may be blocked)"
+    summary_set dns fail "DNS tests failed"
   fi
 }
 
@@ -1162,17 +1183,21 @@ EOF
     log "BBR is available; applying configuration"
   else
     warn "BBR is not available in this kernel; BBR tuning skipped"
+    summary_set network warn "BBR unavailable; applicable tuning completed"
   fi
 
   if sysctl -p /etc/sysctl.d/99-proms-network.conf; then
     if grep -q 'tcp_congestion_control=bbr' /etc/sysctl.d/99-proms-network.conf &&
        [[ "$(sysctl -n net.ipv4.tcp_congestion_control)" != bbr ]]; then
       fail_check "BBR was configured but is not active"
+      summary_set network fail "BBR was configured but is not active"
     else
       pass_check "sysctl network tuning applied"
+      summary_set network ok "BBR + fq configured; tuning applied"
     fi
   else
     fail_check "sysctl network tuning failed"
+    summary_set network fail "sysctl network tuning failed"
   fi
 }
 
@@ -1300,6 +1325,7 @@ configure_unattended_upgrades() {
 
   if ! ensure_apt_units; then
     fail_check "APT vendor units missing and could not be restored from apt; automatic updates are not ready"
+    summary_set updates fail "APT vendor units missing and could not be restored from apt"
     return 0
   fi
   install -d -m 755 /etc/systemd/system/apt-daily.timer.d /etc/systemd/system/apt-daily-upgrade.timer.d
@@ -1362,11 +1388,13 @@ PY
   then
     rollback_transaction
     fail_check "Effective unattended-upgrades settings were overridden; inspect apt-config dump"
+    summary_set updates fail "Effective unattended-upgrades settings were overridden"
     return 0
   fi
   if ! configure_apt_timers; then
     rollback_transaction
     fail_check "Effective APT timer schedule is invalid; previous files and timer states restored"
+    summary_set updates fail "Effective APT timer schedule is invalid"
     return 0
   fi
   systemctl enable --now unattended-upgrades
@@ -1376,10 +1404,12 @@ PY
      systemctl is-active --quiet apt-daily-upgrade.timer; then
     commit_transaction
     pass_check "unattended-upgrades enabled; automatic reboot set to ${AUTO_REBOOT_TIME} ${TIMEZONE}"
+    summary_set updates ok "enabled; reboot time ${AUTO_REBOOT_TIME} ${TIMEZONE}"
     pass_check "APT timers: 02:30 and 02:50 Europe/Moscow, no random delay, persistent"
   else
     rollback_transaction
     fail_check "unattended-upgrades or its APT timers are not active"
+    summary_set updates fail "unattended-upgrades or its APT timers are not active"
   fi
 }
 
@@ -1585,23 +1615,28 @@ configure_ufw() {
   local status port file forwarding
   if ! status="$(ufw status)"; then
     fail_check "Cannot determine UFW state; firewall not changed"
+    summary_set ufw fail "Cannot determine UFW state"
     return 0
   fi
   if grep -qx 'Status: active' <<< "$status"; then
     # Read-only audit: never rewrite an administrator's active firewall.
     if detect_ssh_ports && verify_ufw; then
       pass_check "Existing UFW verified: boot enabled, deny incoming/allow outgoing, IPv4/IPv6 SSH allows; rules unchanged"
+      summary_set ufw ok "active; existing rules preserved"
     else
       fail_check "Active UFW does not pass SSH/defaults/IPv4/IPv6/boot checks; manual review required, firewall unchanged"
+      summary_set ufw fail "Active UFW does not pass SSH/defaults/IPv4/IPv6/boot checks"
     fi
     return 0
   fi
   if ! grep -qx 'Status: inactive' <<< "$status"; then
     fail_check "Unknown UFW state; firewall not changed"
+    summary_set ufw fail "Unknown UFW state"
     return 0
   fi
   if ! detect_ssh_ports; then
     fail_check "Cannot safely confirm live SSH ports/current session; UFW remains disabled"
+    summary_set ufw fail "Cannot safely confirm live SSH ports/current session"
     return 0
   fi
   # Flushing built-in chains would interfere with other firewall owners.
@@ -1609,6 +1644,7 @@ configure_ufw() {
   if ! grep -Eq '^MANAGE_BUILTINS=no$' /etc/default/ufw ||
      ! grep -Eq '^IPV6=yes$' /etc/default/ufw; then
     fail_check "UFW requires MANAGE_BUILTINS=no and IPV6=yes; existing settings preserved, activation skipped"
+    summary_set ufw fail "UFW requires MANAGE_BUILTINS=no and IPV6=yes"
     return 0
   fi
   # An inactive firewall can contain custom pre-user DROP rules or executable
@@ -1616,20 +1652,24 @@ configure_ufw() {
   for file in before.rules before6.rules after.rules after6.rules; do
     if ! cmp -s "/etc/ufw/$file" "/usr/share/ufw/iptables/$file"; then
       fail_check "Custom/missing UFW $file requires manual review; firewall remains disabled"
+      summary_set ufw fail "Custom/missing UFW $file requires manual review"
       return 0
     fi
   done
   if [[ -x /etc/ufw/before.init || -x /etc/ufw/after.init ]]; then
     fail_check "Custom UFW hooks require manual review; firewall remains disabled"
+    summary_set ufw fail "Custom UFW hooks require manual review"
     return 0
   fi
   if ! forwarding="$(sysctl -n net.ipv4.ip_forward net.ipv6.conf.all.forwarding)"; then
     fail_check "Cannot check forwarding before UFW activation; firewall remains disabled"
+    summary_set ufw fail "Cannot check forwarding before UFW activation"
     return 0
   fi
   if grep -qx 1 <<< "$forwarding" &&
      ! grep -Eq '^DEFAULT_FORWARD_POLICY="?ACCEPT"?$' /etc/default/ufw; then
     fail_check "Forwarding is active but UFW routed policy is restrictive; preserve routing and enable UFW manually"
+    summary_set ufw fail "Forwarding is active but UFW routed policy is restrictive"
     return 0
   fi
   begin_transaction ufw /etc/default/ufw /etc/ufw/ufw.conf /etc/ufw/user.rules /etc/ufw/user6.rules
@@ -1637,12 +1677,14 @@ configure_ufw() {
     if ! ufw prepend allow "$port/tcp"; then
       rollback_transaction
       fail_check "Could not add SSH allow rules; UFW remains disabled"
+      summary_set ufw fail "Could not add SSH allow rules"
       return 0
     fi
   done
   if ! ufw_ssh_rules_ok /etc/ufw/user.rules || ! ufw_ssh_rules_ok /etc/ufw/user6.rules ufw6; then
     rollback_transaction
     fail_check "SSH allow rules could not be confirmed before UFW activation; original rules restored"
+    summary_set ufw fail "SSH allow rules could not be confirmed before UFW activation"
     return 0
   fi
   # Independent rollback survives this shell disconnecting or being killed.
@@ -1651,6 +1693,7 @@ configure_ufw() {
        /usr/sbin/ufw --force disable || ! systemctl is-active --quiet "$UFW_GUARD.timer"; then
     rollback_transaction
     fail_check "Cannot arm independent UFW rollback; activation skipped"
+    summary_set ufw fail "Cannot arm independent UFW rollback"
     return 0
   fi
   # SSH allows were written and verified before either restrictive policy or enable.
@@ -1659,15 +1702,18 @@ configure_ufw() {
      ! ufw --force enable || ! systemctl enable ufw.service || ! verify_ufw; then
     rollback_transaction
     fail_check "UFW activation/verification failed; firewall disabled and original files restored"
+    summary_set ufw fail "UFW activation/verification failed"
     return 0
   fi
   if ! cancel_ufw_guard || ! verify_ufw; then
     rollback_transaction
     fail_check "UFW rollback guard or final verification failed; activation reverted"
+    summary_set ufw fail "UFW rollback guard or final verification failed"
     return 0
   fi
   commit_transaction
   pass_check "UFW active and enabled at boot; incoming deny, outgoing allow; SSH TCP ports: ${DETECTED_SSH_PORTS[*]} (current: $CURRENT_SSH_PORT)"
+  summary_set ufw ok "active; SSH access allowed"
 }
 
 configure_fail2ban() {
@@ -1720,6 +1766,7 @@ EOF
   else
     rollback_transaction
     fail_check "fail2ban config validation failed; previous files restored"
+    summary_set fail2ban fail "fail2ban config validation failed"
     return 0
   fi
 
@@ -1727,6 +1774,7 @@ EOF
   if ! fail2ban-client reload; then
     rollback_transaction
     fail_check "fail2ban reload failed; previous files restored"
+    summary_set fail2ban fail "fail2ban reload failed"
     return 0
   fi
 
@@ -1735,16 +1783,90 @@ EOF
     if ! fail2ban-client stop recidive; then
       rollback_transaction
       fail_check "Could not stop legacy recidive jail; previous files restored"
+      summary_set fail2ban fail "Could not stop legacy recidive jail"
       return 0
     fi
   fi
   if fail2ban-client status sshd >/dev/null 2>&1 && ! fail2ban-client status recidive >/dev/null 2>&1; then
     commit_transaction
     pass_check "fail2ban sshd jail is active; recidive is disabled"
+    summary_set fail2ban ok "sshd active; recidive disabled"
   else
     rollback_transaction
     fail_check "fail2ban sshd inactive or recidive still active; previous files restored"
+    summary_set fail2ban fail "fail2ban sshd inactive or recidive still active"
   fi
+}
+
+# Presentation only: never used to decide validation, rollback or exit status.
+summary_set() {
+  local key="$1" state="$2" detail="${3:-}"
+  # Keep a recorded failure/warning when a subsystem later reports partial success.
+  if [[ "${SUMMARY_STATE[$key]:-}" == fail ||
+        ( "${SUMMARY_STATE[$key]:-}" == warn && "$state" == ok ) ]]; then
+    return 0
+  fi
+  SUMMARY_STATE[$key]="$state"
+  SUMMARY_DETAIL[$key]="$detail"
+  return 0
+}
+
+final_summary() {
+  local key label state detail token color reset='' green='' yellow='' red='' cyan='' result
+  # All output is best-effort; presentation must not interrupt the existing result.
+  {
+    if [[ -t 1 && -z "${NO_COLOR+x}" && "${TERM:-}" != dumb ]]; then
+      reset=$'\033[0m'; green=$'\033[32m'; yellow=$'\033[33m'
+      red=$'\033[31m'; cyan=$'\033[36m'
+    fi
+    printf '\n============================================================\n VPS BOOTSTRAP SUMMARY\n============================================================\n\n'
+    while read -r key label; do
+      state="${SUMMARY_STATE[$key]:-info}"
+      detail="${SUMMARY_DETAIL[$key]:-not recorded}"
+      if [[ "$key" == authority ]]; then
+        if [[ ${#SSH_AUTHORITY_FINDINGS[@]} -gt 0 ]]; then
+          state=warn; detail='additional root SSH authority detected; review SECURITY WARNING above'
+        elif [[ -n "${SSH_AUTHORITY_SOURCE_LIMITATION:-}" ]]; then
+          state=warn; detail='effective audit completed; source diagnostics limited'
+        elif [[ -n "${SSH_AUTHORITY_NOTICE:-}" ]]; then
+          state=warn; detail='conditional SSH configuration requires review'
+        elif [[ ${#SSH_AUTHORITY_CONTEXTS[@]} -gt 0 ]]; then
+          state=ok; detail='no additional root SSH authority detected'
+        fi
+      fi
+      case "$state" in
+        ok) token='[✓]'; color="$green" ;;
+        warn) token='[!]'; color="$yellow" ;;
+        fail) token='[✗]'; color="$red" ;;
+        *) token='[i]'; color="$cyan" ;;
+      esac
+      printf ' %s%s%s %-22s %s\n' "$color" "$token" "$reset" "$label" "$detail"
+    done <<'ROWS'
+os OS
+upgrade System upgrade
+keys SSH keys
+policy SSH policy
+authority SSH authority
+dns DNS
+network Network tuning
+updates Automatic updates
+ufw UFW
+fail2ban Fail2ban
+pro Ubuntu Pro
+autoremove Autoremove
+reboot Reboot
+ROWS
+    if [[ ${#FAILED_CHECKS[@]} -gt 0 ]]; then
+      result=FAILED; color="$red"
+    elif [[ ${#WARNINGS[@]} -gt 0 ]]; then
+      result='SUCCESS WITH WARNINGS'; color="$yellow"
+    else
+      result=SUCCESS; color="$green"
+    fi
+    printf '\n------------------------------------------------------------\n Failed checks: %s\n Warnings:      %s\n\n RESULT: %s%s%s\n============================================================\n' \
+      "${#FAILED_CHECKS[@]}" "${#WARNINGS[@]}" "$color" "$result" "$reset"
+  } || :
+  return 0
 }
 
 final_report() {
@@ -1845,13 +1967,17 @@ final_report() {
   echo
   if [[ -f /run/reboot-required ]]; then
     echo "Reboot required: YES. Run manually now if convenient: sudo reboot"
+    summary_set reboot info "required"
   else
     echo "Reboot required: no marker found. No reboot is requested by the package system."
+    summary_set reboot info "not required"
   fi
 
   echo
   ssh_authority_security_report
   echo "Important: do not close this SSH session until you verify a new SSH login with your key."
+
+  final_summary
 
   if [[ ${#FAILED_CHECKS[@]} -gt 0 ]]; then
     return 1
