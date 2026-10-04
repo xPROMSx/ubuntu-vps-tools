@@ -34,6 +34,12 @@ VALID_KEY_TYPES=()
 DETECTED_SSH_PORTS=()
 CURRENT_SSH_PORT=""
 SSH_CONTEXTS=()
+SSH_AUTHORITY_CONTEXTS=()
+SSH_AUTHORITY_FINDINGS=()
+SSH_AUTHORITY_FINDING_KEYS=()
+SSH_AUTHORITY_FINDING_CONTEXTS=()
+SSH_AUTHORITY_NOTICE=""
+SSH_AUTHORITY_SOURCE_LIMITATION=""
 UFW_GUARD=""
 BOOTSTRAP_IPV4=not-tested
 PROVIDER_IPV6=not-tested
@@ -448,7 +454,7 @@ provision_proms_ssh_keys() {
     rm -f -- "$staged"
     die "Could not install local key updater"
   fi
-  pass_check "Exclusive Proms SSH keys provisioned; local updater: sudo update-sshid-proms"
+  pass_check "Managed Proms authorized_keys content provisioned exclusively; local updater: sudo update-sshid-proms"
 }
 
 check_root_authorized_keys() {
@@ -825,6 +831,159 @@ ssh_policy_ok() {
   grep -qx 'authorizedkeysfile .ssh/authorized_keys' <<< "$effective"
 }
 
+# Standard paths only: source locations aid investigation, never prove policy.
+ssh_authority_sources() {
+  local file rc=0
+  for file in /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf; do
+    [[ -f "$file" ]] || continue
+    if [[ -r "$file" ]]; then
+      printf '%s\n' "$file" || return 1
+    else
+      rc=1
+    fi
+  done
+  return "$rc"
+}
+
+ssh_authority_source_lines() {
+  local directive="$1" file files
+  files="$(ssh_authority_sources)" || return 1
+  [[ -n "$files" ]] || return 0
+  while IFS= read -r file; do
+    awk -v directive="$directive" 'tolower($1) == directive {
+      print FILENAME ":" FNR ":" $0
+    }' "$file" || return 1
+  done <<< "$files"
+}
+
+ssh_authority_finding() {
+  local directive="$1" value="$2" context="$3" meaning="$4" details="${5:-}" sources command='sshd -T' identity i
+  identity="$directive"$'\034'"$value"$'\034'"$details"
+  for i in "${!SSH_AUTHORITY_FINDING_KEYS[@]}"; do
+    if [[ "${SSH_AUTHORITY_FINDING_KEYS[$i]}" == "$identity" ]]; then
+      SSH_AUTHORITY_FINDING_CONTEXTS[$i]+=$'\n'"  - $context"
+      return 0
+    fi
+  done
+  SSH_AUTHORITY_FINDING_KEYS+=("$identity")
+  SSH_AUTHORITY_FINDING_CONTEXTS+=("  - $context")
+  [[ "$context" == base ]] || command="sshd -T -C '$context'"
+  if ! sources="$(ssh_authority_source_lines "$directive")"; then
+    sources='effective value confirmed by sshd -T; source lookup unavailable in standard /etc/ssh paths'
+  fi
+  [[ -n "$sources" ]] || sources='effective value confirmed by sshd -T; source not located in standard /etc/ssh paths'
+  SSH_AUTHORITY_FINDINGS+=("Effective root SSH configuration:
+  $directive $value
+${details}Meaning:
+  $meaning
+Source location (investigation hints, not policy evidence):
+$sources
+Where to investigate:
+  $command | grep -i $directive
+  sshd -T -C '<tested root -C context listed above>' | grep -i $directive
+  grep -ni $directive /etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf")
+  warn "Additional effective root SSH authority detected: $directive $value ($context)"
+}
+
+# Called only with the same effective output that passed ssh_policy_ok.
+ssh_authority_audit_context() {
+  local effective="$1" context="$2" key value details
+  local -A policy=()
+  SSH_AUTHORITY_CONTEXTS+=("$context")
+  while read -r key value; do
+    case "$key" in
+      authorizedkeysfile|authorizedkeyscommand|authorizedkeyscommanduser|trustedusercakeys|authorizedprincipalsfile|authorizedprincipalscommand|authorizedprincipalscommanduser|authenticationmethods|pubkeyauthentication|passwordauthentication|kbdinteractiveauthentication|hostbasedauthentication|gssapiauthentication|permitrootlogin|usepam)
+        policy["$key"]="$value" ;;
+    esac
+  done <<< "$effective"
+  if [[ "${policy[authorizedkeyscommand]:-none}" != none ]]; then
+    ssh_authority_finding authorizedkeyscommand "${policy[authorizedkeyscommand]}" "$context" \
+      'sshd may accept public keys returned by this command even when absent from /root/.ssh/authorized_keys.' \
+      "  authorizedkeyscommanduser ${policy[authorizedkeyscommanduser]:-none}"$'\n'
+  fi
+  if [[ "${policy[trustedusercakeys]:-none}" != none ]]; then
+    details="  authorizedprincipalsfile ${policy[authorizedprincipalsfile]:-none}
+  authorizedprincipalscommand ${policy[authorizedprincipalscommand]:-none}
+  authorizedprincipalscommanduser ${policy[authorizedprincipalscommanduser]:-none}
+"
+    ssh_authority_finding trustedusercakeys "${policy[trustedusercakeys]}" "$context" \
+      'User certificates signed by this trusted CA may authorize SSH access without the ordinary public key existing in the managed /root/.ssh/authorized_keys file.' "$details"
+  fi
+  if [[ "${policy[authenticationmethods]:-}" == any ]]; then
+    for key in hostbasedauthentication gssapiauthentication; do
+      if [[ "${policy[$key]:-no}" == yes ]]; then
+        ssh_authority_finding "$key" yes "$context" \
+          'May provide an additional root authentication path if the corresponding host/GSSAPI trust infrastructure is configured.'
+      fi
+    done
+  fi
+}
+
+ssh_authority_match_notice() {
+  local file sources
+  local -a files=()
+  SSH_AUTHORITY_NOTICE=""
+  SSH_AUTHORITY_SOURCE_LIMITATION=""
+  if ! sources="$(ssh_authority_sources)"; then
+    SSH_AUTHORITY_SOURCE_LIMITATION='Conditional source scan unavailable; effective authority audit is unaffected.'
+    return 0
+  fi
+  [[ -n "$sources" ]] || return 0
+  while IFS= read -r file; do files+=("$file"); done <<< "$sources"
+  # Same-file ordering only; do not parse Include/Match grammar.
+  if ! SSH_AUTHORITY_NOTICE="$(awk '
+    FNR == 1 { conditional=0 }
+    tolower($1) == "match" { conditional=1 }
+    conditional && (tolower($1) == "authorizedkeyscommand" || tolower($1) == "trustedusercakeys") && tolower($2) != "none" {
+      print FILENAME ":" FNR ":" $0
+    }
+    conditional && (tolower($1) == "hostbasedauthentication" || tolower($1) == "gssapiauthentication") && tolower($2) == "yes" {
+      print FILENAME ":" FNR ":" $0
+    }
+  ' "${files[@]}")"; then
+    SSH_AUTHORITY_NOTICE=""
+    SSH_AUTHORITY_SOURCE_LIMITATION='Conditional source scan unavailable; effective authority audit is unaffected.'
+  fi
+  return 0
+}
+
+ssh_authority_report() {
+  echo 'SSH authority audit:'
+  echo '  Managed AuthorizedKeysFile: .ssh/authorized_keys'
+  [[ -z "$SSH_AUTHORITY_SOURCE_LIMITATION" ]] || printf '  Diagnostic limitation: %s\n' "$SSH_AUTHORITY_SOURCE_LIMITATION"
+  printf '  Tested root contexts: %s\n' "${SSH_AUTHORITY_CONTEXTS[@]}"
+  if [[ ${#SSH_AUTHORITY_FINDINGS[@]} -eq 0 ]]; then
+    echo '  Additional effective root SSH authorization sources: none detected'
+    if [[ -n "$SSH_AUTHORITY_NOTICE" ]]; then
+      echo '  Effective tested root contexts: clean'
+      echo '  NOTICE: conditional security-sensitive SSH configuration detected'
+      printf '%s\n' "$SSH_AUTHORITY_NOTICE"
+      echo '  Sensitive directives follow Match in the same source file; Include/Match grammar is not fully parsed.'
+      echo '  No additional path is active in tested root contexts; another source/destination/host context may evaluate differently.'
+      echo '  Bootstrap action: no changes made to these mechanisms.'
+      echo '  Review manually if this server accepts SSH from other networks/addresses.'
+    fi
+  else
+    echo '  Additional effective root SSH authorization sources: detected (see SECURITY WARNING below)'
+  fi
+}
+
+ssh_authority_security_report() {
+  local i
+  [[ ${#SSH_AUTHORITY_FINDINGS[@]} -gt 0 ]] || return 0
+  echo '================================================================'
+  echo 'SECURITY WARNING: ADDITIONAL ROOT SSH AUTHORITY DETECTED'
+  echo '================================================================'
+  for i in "${!SSH_AUTHORITY_FINDINGS[@]}"; do
+    echo 'Observed in tested root contexts:'
+    printf '%s\n' "${SSH_AUTHORITY_FINDING_CONTEXTS[$i]}"
+    printf '%s\n\n' "${SSH_AUTHORITY_FINDINGS[$i]}"
+  done
+  echo 'Bootstrap did NOT disable or modify these mechanisms.'
+  echo 'Review them before treating root SSH access as exclusive to the managed Proms authorized_keys.'
+  echo '================================================================'
+}
+
 check_systemd_manager() {
   local version
   if ! version="$(systemctl --system show --property=Version --value)" || [[ -z "$version" ]]; then
@@ -910,8 +1069,10 @@ EOF
   sshd -t || die "New SSH config invalid; restoring original files"
   effective="$(sshd -T)"
   ssh_policy_ok "$effective" || die "Base SSH policy conflicts with key-only login; restoring original files"
+  ssh_authority_audit_context "$effective" base
   effective="$(sshd -T -C user=root,host=localhost,addr=127.0.0.1)"
   ssh_policy_ok "$effective" || die "Root SSH policy conflicts with key-only login; restoring original files"
+  ssh_authority_audit_context "$effective" user=root,host=localhost,addr=127.0.0.1
   local context
   # Exact session when known; otherwise every established SSH candidate from
   # the conservative listener fallback, so sudo cannot bypass Match validation.
@@ -919,12 +1080,14 @@ EOF
     read -r remote _rport localaddr localport <<< "$context"
     effective="$(sshd -T -C "user=root,host=$remote,addr=$remote,laddr=$localaddr,lport=$localport")"
     ssh_policy_ok "$effective" || die "SSH Match rules conflict for current/candidate client; restoring original files"
+    ssh_authority_audit_context "$effective" "user=root,host=$remote,addr=$remote,laddr=$localaddr,lport=$localport"
   done
   if grep -Eq '^(allowusers|denyusers|allowgroups|denygroups) ' <<< "$effective"; then
     warn "SSH access lists are present; they are preserved and still apply"
   fi
   apply_ssh_runtime_config || die "SSH runtime validation/reload failed; restoring original files"
   commit_transaction
+  ssh_authority_match_notice
   pass_check "SSH syntax, effective root key-only policy and active listener verified"
   warn "A local key check cannot prove remote login. Test a second session with both SSH ID and YubiKey before closing this one; other Match contexts may differ"
 }
@@ -1605,6 +1768,7 @@ final_report() {
   find /etc/ssh/sshd_config.d -maxdepth 1 -name '*.conf' -printf '  %f\n' | sort
   echo "  Validated SSH key types:"
   printf '    %s\n' "${VALID_KEY_TYPES[@]}" | sort -u
+  ssh_authority_report
   echo "SSH listening sockets:"
   ss -H -ltnp 2>/dev/null | awk '/"sshd|"systemd"/ {print "  " $0}' || true
   systemctl show ssh.socket -p ActiveState -p Listen --no-pager 2>/dev/null || true
@@ -1686,6 +1850,7 @@ final_report() {
   fi
 
   echo
+  ssh_authority_security_report
   echo "Important: do not close this SSH session until you verify a new SSH login with your key."
 
   if [[ ${#FAILED_CHECKS[@]} -gt 0 ]]; then
