@@ -57,9 +57,10 @@ verify() {
   ssh-keygen -lf /root/.ssh/authorized_keys >/dev/null
   # shellcheck disable=SC2016 # Evaluated by the guest SSH server, not this shell.
   ssh_test 'test "$(id -u)" = 0' >/dev/null
-  # No password prompt or interactive fallback may succeed.
+  # Negative login uses loopback (existing Fail2ban ignoreip), avoiding a test-induced
+  # ban of the forwarded control connection after repeated assertions.
   if ssh -o BatchMode=yes -o PubkeyAuthentication=no -o StrictHostKeyChecking=yes \
-    -o ConnectTimeout=10 -p "$port" root@10.0.2.2 true 2>/dev/null; then
+    -o ConnectTimeout=10 -p 22 root@127.0.0.1 true 2>/dev/null; then
     fail 'non-key root login succeeded'
   fi
   ss -ltn | grep -q ':22 '
@@ -152,7 +153,7 @@ case "$stage" in
       STATE_DIR=$(mktemp -d)
       cp -a /etc/systemd/resolved.conf.d/90-proms-dot.conf "$STATE_DIR/original"
       old_link=$(readlink /etc/resolv.conf)
-      # shellcheck disable=SC2329 # Called indirectly by production configure_resolved.
+      # shellcheck disable=SC2329,SC2317 # Called indirectly by production configure_resolved.
       resolvectl() { if [[ ${1:-} == query ]]; then return 1; fi; command resolvectl "$@"; }
       configure_resolved > /root/ci-recovery.log 2>&1
       [[ ${#FAILED_CHECKS[@]} == 1 && -z "$TX_SERVICE" ]]

@@ -23,6 +23,10 @@ codename = {'24.04': 'noble', '26.04': 'resolute'}[release]
 
 def record(text):
     print(text, flush=True)
+    if text.startswith(('PASS:', 'FAIL:', 'DIAG:', 'Image:', 'Ubuntu ')):
+        safe = text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A')
+        level = 'error' if text.startswith('FAIL:') else 'notice'
+        print(f'::{level}::{safe}', flush=True)
     with DIAG.open('a') as handle:
         handle.write(text + '\n')
 
