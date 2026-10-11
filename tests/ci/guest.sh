@@ -8,10 +8,19 @@ port=${2:?forwarded SSH port required}
 fail() { echo "FAIL: $*"; exit 1; }
 trap 'echo "FAIL: guest assertion at line $LINENO"' ERR
 ssh_test() {
-  ssh -i /root/ci-login -o IdentitiesOnly=yes -o BatchMode=yes \
+  local rc
+  if ssh -i /root/ci-login -o IdentitiesOnly=yes -o BatchMode=yes \
     -o StrictHostKeyChecking=accept-new -o ConnectTimeout=15 -p "$port" \
-    root@10.0.2.2 "$@"
+    root@10.0.2.2 "$@" 2>/root/ci-ssh-error; then
+    return 0
+  else
+    rc=$?
+    # Safe client errors only; no key bodies or verbose private configuration.
+    awk '/Permission denied|Connection refused|Connection timed out|No route|Could not resolve|Host key verification|ssh:/ {print "FAIL: SSH " $0}' /root/ci-ssh-error
+    return "$rc"
+  fi
 }
+
 bootstrap() {
   local name=$1; shift
   # Key stays in guest; connect through host forwarding, not a local loopback exemption.

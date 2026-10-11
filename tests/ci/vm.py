@@ -115,7 +115,10 @@ try:
     console.connect(str(serial))
     console.settimeout(1)
 
+    pending_line = ''
+
     def wait_for(pattern, seconds):
+        global pending_line
         deadline = time.monotonic() + seconds
         buffer = ''
         while time.monotonic() < deadline:
@@ -126,9 +129,12 @@ try:
                 if not data:
                     raise RuntimeError('VM console disconnected')
                 buffer = (buffer + data.decode(errors='replace'))[-200000:]
-                # Only CI result/assertion lines are persisted; no guest configs/key material.
-                for line in data.decode(errors='replace').splitlines():
-                    if re.match(r'^(PASS|FAIL): ', line):
+                # Serial reads can split any byte/line: never parse per recv chunk.
+                pending_line += data.decode(errors='replace')
+                while '\n' in pending_line:
+                    line, pending_line = pending_line.split('\n', 1)
+                    line = re.sub(r'\x1b\[[0-?]*[ -/]*[@-~]', '', line).strip()
+                    if re.match(r'^(PASS|FAIL|DIAG): ', line):
                         record(line)
                 match = re.search(pattern, buffer)
                 if match:
@@ -163,18 +169,8 @@ except Exception as error:
     if console is not None and qemu is not None and qemu.poll() is None:
         # Targeted state only: never dump private configs, journal or authorized_keys.
         try:
-            console.sendall(b"printf '\\nCI_DIAGNOSTICS\\n'; systemctl is-active ssh.socket ssh.service systemd-resolved ufw fail2ban apt-daily.timer apt-daily-upgrade.timer; ufw status; resolvectl dns; ss -ltn; printf '\\n__DIAG_END__\\n'\n")
-            end = time.monotonic() + 10
-            while time.monotonic() < end:
-                try:
-                    data = console.recv(65536).decode(errors='replace')
-                    for line in data.splitlines():
-                        if line and not any(word in line for word in ('printf', 'root@', '__DIAG_END__')):
-                            record('DIAG: ' + line)
-                    if data.strip().endswith('__DIAG_END__'):
-                        break
-                except socket.timeout:
-                    pass
+            console.sendall(b"for u in ssh.socket ssh.service systemd-resolved ufw fail2ban; do printf 'DIAG: %s %s\\n' \"$u\" \"$(systemctl is-active \"$u\")\"; done; sshd -T | grep -E '^(authorizedkeyscommand|authorizedkeyscommanduser|permitrootlogin) ' | sed 's/^/DIAG: /'; printf '\\n__DIAG_END__\\n'\n")
+            wait_for(r'^__DIAG_END__\r?$', 10)
         except OSError:
             record('Diagnostic console unavailable')
     raise
