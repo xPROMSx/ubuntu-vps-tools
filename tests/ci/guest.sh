@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Executed only inside a disposable QEMU guest, never on the Actions runner.
 set -Eeuo pipefail
+set +x
 umask 077
 [[ -f /opt/ci/disposable-guest ]] || exit 90
 stage=${1:?stage required}
@@ -52,12 +53,17 @@ PY
 }
 verify() {
   local effective
+  # A real SSH connection activates ssh.service after reboot before sshd -T.
+  # shellcheck disable=SC2016 # Evaluated remotely.
+  ssh_test 'test "$(id -u)" = 0' >/dev/null
   effective=$(sshd -T -C user=root,host=localhost,addr=127.0.0.1)
   for setting in 'pubkeyauthentication yes' 'passwordauthentication no' \
-    'kbdinteractiveauthentication no' 'permitrootlogin prohibit-password' \
+    'kbdinteractiveauthentication no' \
     'authorizedkeysfile .ssh/authorized_keys'; do
     grep -Fxq "$setting" <<< "$effective"
   done
+  # OpenSSH releases serialize these equivalent policy values differently.
+  grep -Eq '^permitrootlogin (prohibit-password|without-password)$' <<< "$effective"
   [[ $(stat -c '%u:%g:%a' /root/.ssh/authorized_keys) == 0:0:600 ]]
   grep -q '^# BEGIN PERSONAL ED25519 ' /root/.ssh/authorized_keys
   [[ $(grep -c '^sk-ssh-ed25519@openssh.com ' /root/.ssh/authorized_keys) -ge 2 ]]
@@ -66,15 +72,13 @@ verify() {
     fail 'foreign CI identity in managed authorized_keys'
   fi
   ssh-keygen -lf /root/.ssh/authorized_keys >/dev/null
-  # shellcheck disable=SC2016 # Evaluated by the guest SSH server, not this shell.
-  ssh_test 'test "$(id -u)" = 0' >/dev/null
   # Negative login uses loopback (existing Fail2ban ignoreip), avoiding a test-induced
   # ban of the forwarded control connection after repeated assertions.
-  if ssh -o BatchMode=yes -o PubkeyAuthentication=no -o StrictHostKeyChecking=yes \
-    -o ConnectTimeout=10 -p 22 root@127.0.0.1 true 2>/dev/null; then
+  if ssh -o BatchMode=yes -o PubkeyAuthentication=no \
+    -o StrictHostKeyChecking=accept-new -o ConnectTimeout=10 -p 22 root@127.0.0.1 true 2>/dev/null; then
     fail 'non-key root login succeeded'
   fi
-  ss -ltn | grep -q ':22 '
+  ss -ltn | grep ':22 ' >/dev/null
   grep -Fxq DNSOverTLS=yes /etc/systemd/resolved.conf.d/90-proms-dot.conf
   systemctl is-active --quiet systemd-resolved
   resolvectl flush-caches
@@ -83,19 +87,19 @@ verify() {
   [[ $(sysctl -n net.ipv4.tcp_fastopen) == 3 ]]
   [[ $(sysctl -n net.core.rmem_max) == 16777216 ]]
   [[ $(sysctl -n net.core.wmem_max) == 16777216 ]]
-  if sysctl net.ipv4.tcp_available_congestion_control | grep -qw bbr; then
+  if sysctl net.ipv4.tcp_available_congestion_control | grep -w bbr >/dev/null; then
     [[ $(sysctl -n net.ipv4.tcp_congestion_control) == bbr ]]
     [[ $(sysctl -n net.core.default_qdisc) == fq ]]
   fi
-  if ip -6 route show default | grep -q '^unreachable default.*metric 1'; then
+  if ip -6 route show default | grep '^unreachable default.*metric 1' >/dev/null; then
     fail 'bootstrap IPv6 guard retained'
   fi
-  ufw status | grep -Fxq 'Status: active'
+  ufw status | grep -Fx 'Status: active' >/dev/null
   grep -Fxq 'DEFAULT_INPUT_POLICY="DROP"' /etc/default/ufw
   grep -Fxq 'DEFAULT_OUTPUT_POLICY="ACCEPT"' /etc/default/ufw
   grep -Fxq IPV6=yes /etc/default/ufw
-  ufw status | grep -Eq '22/tcp.*ALLOW'
-  ufw status | grep -Eq '22/tcp \(v6\).*ALLOW'
+  ufw status | grep -E '22/tcp.*ALLOW' >/dev/null
+  ufw status | grep -E '22/tcp \(v6\).*ALLOW' >/dev/null
   systemctl is-enabled --quiet ufw
   systemctl is-active --quiet fail2ban
   fail2ban-client status sshd >/dev/null
@@ -104,15 +108,15 @@ verify() {
     systemctl is-active --quiet "$unit"
     systemctl is-enabled --quiet "$unit"
   done
-  apt-config dump | grep -Fq 'Unattended-Upgrade::Automatic-Reboot "true"'
-  apt-config dump | grep -Fq 'Unattended-Upgrade::Automatic-Reboot-Time "04:38"'
+  apt-config dump | grep -F 'Unattended-Upgrade::Automatic-Reboot "true"' >/dev/null
+  apt-config dump | grep -F 'Unattended-Upgrade::Automatic-Reboot-Time "04:38"' >/dev/null
   [[ $(timedatectl show -p Timezone --value) == Europe/Moscow ]]
   pro status --format json | python3 -c 'import json,sys; assert json.load(sys.stdin)["attached"] is False'
   [[ -z $(dpkg --audit) ]]
   echo 'PASS: real SSH/DoT/sysctl/UFW/Fail2ban/timers/Pro/dpkg state'
 }
 snapshot() {
-  sha256sum /root/.ssh/authorized_keys /etc/default/ufw /etc/ufw/user.rules \
+  sha256sum /root/.ssh/authorized_keys /etc/ssh/sshd_config /etc/default/ufw /etc/ufw/user.rules \
     /etc/ufw/user6.rules /etc/ssh/sshd_config.d/00-proms-hardening.conf \
     /etc/systemd/resolved.conf.d/90-proms-dot.conf /etc/sysctl.d/99-proms-network.conf \
     /etc/fail2ban/fail2ban.local /etc/fail2ban/jail.d/sshd.local \
@@ -150,6 +154,7 @@ case "$stage" in
     echo 'PASS: full installation + idempotent no-upgrade rerun'
     ;;
   reboot)
+    cloud-init status --wait >/dev/null
     [[ $(cat /proc/sys/kernel/random/boot_id) != "$(cat /root/ci-boot-id)" ]]
     verify
     snapshot > /root/ci-reboot
