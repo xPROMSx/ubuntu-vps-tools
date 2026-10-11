@@ -174,8 +174,12 @@ case "$stage" in
       STATE_DIR=$(mktemp -d)
       cp -a /etc/systemd/resolved.conf.d/90-proms-dot.conf "$STATE_DIR/original"
       old_link=$(readlink /etc/resolv.conf)
+      # timeout launches an external command, so a resolvectl shell function is not used.
       # shellcheck disable=SC2329,SC2317 # Called indirectly by production configure_resolved.
-      resolvectl() { if [[ ${1:-} == query ]]; then return 1; fi; command resolvectl "$@"; }
+      timeout() {
+        if [[ ${2:-} == resolvectl && ${3:-} == query ]]; then return 1; fi
+        command timeout "$@"
+      }
       configure_resolved > /root/ci-recovery.log 2>&1
       [[ ${#FAILED_CHECKS[@]} == 1 && -z "$TX_SERVICE" ]]
       cmp "$STATE_DIR/original" /etc/systemd/resolved.conf.d/90-proms-dot.conf
