@@ -16,7 +16,7 @@ ssh_test() {
   else
     rc=$?
     # Safe client errors only; no key bodies or verbose private configuration.
-    awk '/Permission denied|Connection refused|Connection timed out|No route|Could not resolve|Host key verification|ssh:/ {print "FAIL: SSH " $0}' /root/ci-ssh-error
+    awk '/Permission denied|Connection refused|Connection timed out|No route|Could not resolve|Host key verification|ssh:/ {print "FAIL: SSH " $0}' /root/ci-ssh-error >&2
     return "$rc"
   fi
 }
@@ -32,6 +32,8 @@ import re,sys
 text=re.sub(r'\x1b\[[0-9;]*m','',open(sys.argv[1]).read())
 assert 'RESULT: SUCCESS WITH WARNINGS' in text or 'RESULT: SUCCESS\n' in text
 assert 'FAILED CHECK:' not in text
+if sys.argv[1].endswith('/initial.log'):
+    assert 'Full upgrade and autoclean completed' in text, 'Default package upgrade not completed'
 allowed=(
  'No Ubuntu Pro token provided;', 'Automatic package removal skipped;',
  'A local key check cannot prove remote login.', 'Global DoT does not override',
@@ -126,7 +128,12 @@ case "$stage" in
     chmod 700 /opt/ci/key-helper
     printf 'AuthorizedKeysCommand /opt/ci/key-helper\nAuthorizedKeysCommandUser root\n' \
       > /etc/ssh/sshd_config.d/99-ci-authority.conf
-    sshd -t
+    # Test fixture validates config before production ensure_sshd_runtime_dir runs.
+    install -d -m 0755 -o root -g root /run/sshd
+    if ! sshd -t 2>/root/ci-sshd-error; then
+      sed 's/^/FAIL: sshd fixture /' /root/ci-sshd-error >&2
+      fail 'invalid test authority fixture'
+    fi
     if systemctl is-active --quiet ssh.service; then systemctl reload ssh.service; fi
     # Readiness is already established by cloud-init; this connection is a real assertion.
     ssh_test true >/dev/null

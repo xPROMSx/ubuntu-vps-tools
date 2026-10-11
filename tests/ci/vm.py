@@ -147,6 +147,20 @@ try:
     console.sendall(b'\n')
     wait_for(r'root@bootstrap-ci:[^\r\n]*#', 120)
 
+    # Readiness polling is not a retried installation/login test.
+    deadline = time.monotonic() + 120
+    while True:
+        try:
+            with socket.create_connection(('127.0.0.1', port), timeout=5) as probe:
+                probe.settimeout(5)
+                if probe.recv(256).startswith(b'SSH-2.0-'):
+                    break
+        except (OSError, TimeoutError):
+            pass
+        if time.monotonic() >= deadline:
+            raise TimeoutError('SSH banner readiness failed')
+        time.sleep(1)
+
     def stage(name, seconds):
         console.sendall((f"bash /opt/ci/guest.sh {name} {port}; rc=$?; "
                          f"printf '\\n__CI_{name}_%s__\\n' \"$rc\"\n").encode())
@@ -169,8 +183,9 @@ except Exception as error:
     if console is not None and qemu is not None and qemu.poll() is None:
         # Targeted state only: never dump private configs, journal or authorized_keys.
         try:
-            console.sendall(b"for u in ssh.socket ssh.service systemd-resolved ufw fail2ban; do printf 'DIAG: %s %s\\n' \"$u\" \"$(systemctl is-active \"$u\")\"; done; sshd -T | grep -E '^(authorizedkeyscommand|authorizedkeyscommanduser|permitrootlogin) ' | sed 's/^/DIAG: /'; printf '\\n__DIAG_END__\\n'\n")
-            wait_for(r'^__DIAG_END__\r?$', 10)
+            diagnostic = r"""for u in ssh.socket ssh.service systemd-resolved ufw fail2ban; do printf 'DIAG: %s %s\n' "$u" "$(systemctl is-active "$u")"; done; sshd -T | grep -E '^(authorizedkeyscommand|authorizedkeyscommanduser|permitrootlogin) ' | sed 's/^/DIAG: /'; printf '\n__DIAG_END__\n'"""
+            console.sendall((diagnostic + "\n").encode())
+            wait_for(r'(?m)^__DIAG_END__\r?$', 10)
         except OSError:
             record('Diagnostic console unavailable')
     raise
