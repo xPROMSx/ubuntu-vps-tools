@@ -29,15 +29,63 @@ bootstrap() {
     fail "production bootstrap $name returned failure (log retained only in guest)"
   fi
   python3 - "/root/$name.log" <<'PY'
-import re,sys
+import re,subprocess,sys
 text=re.sub(r'\x1b\[[0-9;]*m','',open(sys.argv[1]).read())
-assert 'RESULT: SUCCESS WITH WARNINGS' in text or 'RESULT: SUCCESS\n' in text
-assert 'FAILED CHECK:' not in text
+
+def check(condition, label):
+    if condition:
+        return
+    print('\nFAIL: ' + label, flush=True)
+    # Only known installer status phrases; never echo arbitrary log contents.
+    match=re.search(r'\[(✓|!|i|✗)\] Swap\s+([^\r\n]+)', text)
+    known=(
+        '1 GiB active; persistent', 'existing swap preserved', 'skipped by --noswap',
+        'skipped; could not inspect active swap',
+        'skipped; existing inactive /swapfile requires manual review',
+        'skipped; /etc/fstab is not a regular non-symlink file',
+        'skipped; could not read /etc/fstab',
+        'skipped; existing /swapfile fstab entry requires manual review',
+        'skipped; could not determine filesystem', 'skipped; unsupported filesystem',
+        'skipped; could not determine free space', 'skipped; less than 4 GiB free',
+        'skipped; creation/activation failed',
+        '1 GiB active; persistence failed; review /etc/fstab manually',
+        '1 GiB active; persistence not confirmed; review /etc/fstab manually',
+        'active; temporary file cleanup failed; review manually',
+        'activation could not be confirmed; file retained for manual review',
+    )
+    observed=('[' + match[1] + '] ' + match[2]) if match and match[2] in known else 'missing or unrecognized (redacted)'
+    print('DIAG: Observed Swap summary: ' + observed, flush=True)
+    # Whitelisted errors already in the private guest log, not raw stderr/log lines.
+    for error in ('Invalid argument', 'swapfile has holes', 'Permission denied',
+                  'Operation not permitted', 'Device or resource busy', 'Cannot allocate memory'):
+        if re.search(r'^(?:swapon|mkswap):[^\n]*' + re.escape(error), text, re.M):
+            print('DIAG: swap tool error: ' + error, flush=True)
+    commands=(
+        ('Active swap TYPE/SIZE bytes', ['swapon','--show=TYPE,SIZE','--bytes','--noheadings'], r'(?:file|partition)\s+[0-9]+(?:\s+(?:file|partition)\s+[0-9]+)*'),
+        ('/swapfile size:uid:gid:mode:nlink', ['stat','-c','%s:%u:%g:%a:%h','/swapfile'], r'[0-9:]+'),
+        ('Filesystem', ['findmnt','-n','-o','FSTYPE','-T','/'], r'(?:ext4|xfs|btrfs|zfs|tmpfs|overlay|nfs|nfs4)'),
+        ('Free bytes', ['df','-B1','--output=avail','/'], r'[0-9]+'),
+        ('/swapfile fstab entries', ['awk','$1 == "/swapfile" {n++} END {print n+0}','/etc/fstab'], r'[0-9]+'),
+    )
+    for name, command, pattern in commands:
+        result=subprocess.run(command, capture_output=True, text=True)
+        value=result.stdout.strip()
+        if name == 'Free bytes':
+            value=value.splitlines()[-1] if value else ''
+        safe=value if result.returncode == 0 and re.fullmatch(pattern, value) else 'none/unavailable'
+        print('DIAG: ' + name + ': ' + safe, flush=True)
+    raise SystemExit(1)
+
+check('RESULT: SUCCESS WITH WARNINGS' in text or 'RESULT: SUCCESS\n' in text,
+      'bootstrap success RESULT assertion')
+check('FAILED CHECK:' not in text, 'bootstrap absence of FAILED CHECK assertion')
 if sys.argv[1].endswith('/initial.log'):
-    assert 'Full upgrade and autoclean completed' in text, 'Default package upgrade not completed'
-    assert re.search(r'\[✓\] Swap\s+1 GiB active; persistent', text)
+    check('Full upgrade and autoclean completed' in text, 'default package upgrade completion assertion')
+    check(re.search(r'\[✓\] Swap\s+1 GiB active; persistent', text),
+          'swap initial provisioning assertion; expected [✓] 1 GiB active; persistent')
 else:
-    assert re.search(r'\[i\] Swap\s+existing swap preserved', text)
+    check(re.search(r'\[i\] Swap\s+existing swap preserved', text),
+          'swap rerun preservation assertion; expected [i] existing swap preserved')
 allowed=(
  'No Ubuntu Pro token provided;', 'Automatic package removal skipped;',
  'A local key check cannot prove remote login.', 'Global DoT does not override',
@@ -50,7 +98,7 @@ allowed=(
  'apt-daily-upgrade.timer is waiting for its running APT service;',
 )
 warnings=re.findall(r'^WARN: (.*)$',text,re.M)
-assert all(w.startswith(allowed) for w in warnings), 'Unclassified bootstrap warning (see private guest log)'
+check(all(w.startswith(allowed) for w in warnings), 'bootstrap warning allowlist assertion')
 print('PASS: bootstrap result; warnings explicitly classified:',len(warnings))
 PY
 }

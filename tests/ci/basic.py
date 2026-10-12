@@ -2,6 +2,7 @@
 import os
 import pathlib
 import re
+import shlex
 import subprocess
 import tempfile
 
@@ -132,3 +133,29 @@ fi
         assert re.search(re.escape(token) + r" Swap\s+.*" + re.escape(detail), result.stdout)
         assert "RESULT: FAILED" not in result.stdout
         print(f"PASS: swap SIMULATION {name}; summary and non-fatal result")
+
+# Exercise the actual guest log assertions without VM commands or raw-log output.
+guest = (ROOT / "tests/ci/guest.sh").read_text()
+assertions = re.search(r'python3 - "/root/\$name.log" <<\'PY\'\n(.*?)\nPY', guest, re.S).group(1)
+with tempfile.TemporaryDirectory() as directory:
+    fixture = pathlib.Path(directory) / "initial.log"
+    clean = 'RESULT: SUCCESS\nFull upgrade and autoclean completed\n[✓] Swap  1 GiB active; persistent\n'
+    samples = (
+        (clean, True, 'PASS: bootstrap result'),
+        (clean.replace('RESULT: SUCCESS\n', ''), False, 'success RESULT assertion'),
+        (clean + 'FAILED CHECK: redacted fixture\n', False, 'absence of FAILED CHECK assertion'),
+        (clean.replace('Full upgrade and autoclean completed', ''), False, 'package upgrade completion assertion'),
+        (clean.replace('[✓] Swap  1 GiB active; persistent',
+                       '[!] Swap  skipped; creation/activation failed'), False, 'swap initial provisioning assertion'),
+        (clean + 'WARN: PRIVATE_DIAG_CANARY\n', False, 'warning allowlist assertion'),
+        (clean.replace('[✓] Swap  1 GiB active; persistent',
+                       '[!] Swap  PRIVATE_DIAG_CANARY'), False, 'swap initial provisioning assertion'),
+    )
+    for content, success, expected in samples:
+        fixture.write_text(content)
+        isolated = ('import subprocess,sys,types; '
+                    'subprocess.run=lambda *a,**kw: types.SimpleNamespace(returncode=0,stdout="PRIVATE_DIAG_CANARY"); '
+                    f'sys.argv=["fixture",{str(fixture)!r}]; exec({assertions!r})')
+        output = run("python3 -c " + shlex.quote(isolated), success=success).stdout
+        assert expected in output and 'PRIVATE_DIAG_CANARY' not in output
+    print('PASS: guest assertion labels, strict swap success requirement and diagnostic redaction')
