@@ -1,0 +1,63 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  basic:
+    name: Basic checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - run: |
+          bash -n vps-bootstrap-ubuntu24.sh
+          bash -n tests/ci/guest.sh
+          # Existing baseline SC2004 is an arithmetic-index style nit only.
+          shellcheck --exclude=SC2004 vps-bootstrap-ubuntu24.sh
+          shellcheck tests/ci/guest.sh
+          python3 tests/ci/basic.py
+  vm:
+    name: Ubuntu ${{ matrix.release }} VM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['24.04', '26.04']
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install VM tooling
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils
+      - name: Real installation, rerun, reboot and recovery
+        run: python3 tests/ci/vm.py '${{ matrix.release }}'
+      - name: Sanitized diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ matrix.release }}
+          path: /tmp/bootstrap-ci/diagnostics.txt
+          if-no-files-found: error
+          retention-days: 7
+  required:
+    name: Required
+    if: always()
+    needs: [basic, vm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - env:
+          BASIC: ${{ needs.basic.result }}
+          VM: ${{ needs.vm.result }}
+        run: test "$BASIC" = success && test "$VM" = success
