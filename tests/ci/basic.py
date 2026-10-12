@@ -70,6 +70,7 @@ cases = (
     ("fstab", "printf '%s none swap sw 0 0\\n' \"$SWAP_TEST_FILE\" >> \"$SWAP_TEST_FSTAB\"",
      "warn", "fstab entry"),
     ("persistence", "FAIL_BACKUP=1", "warn", "persistence failed"),
+    ("active-unlink", "BLOCK_ACTIVE_UNLINK=1", "ok", "1 GiB active; persistent"),
 )
 with tempfile.TemporaryDirectory() as directory:
     for name, setup, state, detail in cases:
@@ -93,7 +94,18 @@ findmnt() { printf '%s\n' "$FS"; }
 df() { printf 'Avail\n%s\n' "$FREE"; }
 fallocate() { printf allocated > "${@: -1}"; }
 chown() { :; }
-stat() { printf '1073741824:0:0:600\n'; }
+stat() {
+  if [[ ${2:-} == '%s:%u:%g:%a' ]]; then printf '1073741824:0:0:600\n';
+  else command stat "$@"; fi
+}
+rm() {
+  if [[ ${BLOCK_ACTIVE_UNLINK:-0} == 1 && -n "$ACTIVE" ]]; then
+    for file in "$@"; do
+      if [[ -e "$file" && "$file" -ef "$ACTIVE" ]]; then return 1; fi
+    done
+  fi
+  command rm "$@"
+}
 mkswap() { printf 'mkswap\n' >> "$SWAP_TEST_DIR/calls"; [[ ${FAIL_MKSWAP:-0} == 0 ]]; }
 backup_file() { [[ ${FAIL_BACKUP:-0} == 0 ]] && cp "$1" "$SWAP_TEST_DIR/backup"; }
 '''
@@ -107,6 +119,7 @@ final_summary
 [[ $(cat "$SWAP_TEST_DIR/foreign") == foreign ]]
 if [[ ${SUMMARY_STATE[swap]} == ok ]]; then
   [[ "$ACTIVE" == "$SWAP_TEST_FILE" ]]
+  [[ $(command stat -c %h "$SWAP_TEST_FILE") == 1 ]]
   [[ $(grep -Fc "$SWAP_TEST_FILE none swap sw 0 0" "$SWAP_TEST_FSTAB") == 1 ]]
   cp "$SWAP_TEST_FSTAB" "$SWAP_TEST_DIR/after"
   inode=$(command stat -c %i "$SWAP_TEST_FILE")

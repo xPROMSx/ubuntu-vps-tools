@@ -172,7 +172,7 @@ backup_file() {
 
 
 configure_swap() {
-  local active filesystem available configured temporary='' fstab_temporary='' reason=''
+  local active filesystem available configured temporary='' fstab_temporary='' reason='' owned_inode=''
   if [[ "$CONFIGURE_SWAP" -eq 0 ]]; then
     summary_set swap info "skipped by --noswap"
     return 0
@@ -211,12 +211,12 @@ configure_swap() {
      chmod 600 "$temporary" && chown root:root "$temporary" &&
      fallocate -l 1073741824 "$temporary" &&
      [[ $(stat -c '%s:%u:%g:%a' "$temporary") == 1073741824:0:0:600 ]] &&
+     owned_inode=$(stat -c '%d:%i' "$temporary") &&
      mkswap "$temporary" >/dev/null && ln -T -- "$temporary" /swapfile &&
+     rm -- "$temporary" && temporary='' &&
      swapon /swapfile; then
     # Once activated, retain the file even if persistence fails; never swapoff.
-    if ! rm -- "$temporary"; then
-      reason='active; temporary file cleanup failed; review manually'
-    elif ! active=$(swapon --show=NAME --noheadings) ||
+    if ! active=$(swapon --show=NAME --noheadings) ||
          ! grep -Fxq /swapfile <<< "$active"; then
       reason='activation could not be confirmed; file retained for manual review'
     # Stage a minimal append on the same filesystem, using the existing backup helper.
@@ -236,7 +236,8 @@ configure_swap() {
   else
     reason='skipped; creation/activation failed'
     # Remove only this invocation's newly published inode, never a competing file.
-    if [[ -n "$temporary" && ! -L /swapfile && "$temporary" -ef /swapfile ]]; then
+    if [[ -n "$owned_inode" && ! -L /swapfile &&
+          $(stat -c '%d:%i' /swapfile 2>/dev/null) == "$owned_inode" ]]; then
       if ! rm -- /swapfile; then reason+='; unfinished file cleanup failed'; fi
     fi
     if [[ -n "$temporary" ]]; then
