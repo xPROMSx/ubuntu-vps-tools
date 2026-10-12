@@ -38,6 +38,8 @@ for tz in ("../etc/passwd", "/etc/passwd", "Not/AZone"):
 run(prefix + "IGNORE_IPS=$'127.0.0.1\\nother'; validate_inputs", success=False)
 run(prefix + "parse_args --no-upgrade --autoremove --skip-dns; "
     "[[ $RUN_UPGRADE == 0 && $RUN_AUTOREMOVE == 1 && $CONFIGURE_DNS == 0 ]]")
+run(prefix + "parse_args --noswap; [[ $CONFIGURE_SWAP == 0 ]]")
+assert "--noswap" in run(f"bash {SCRIPT} --help").stdout
 # Isolate OS validation against fixture os-release files, not runner's identity.
 check = re.search(r"^check_os\(\) \{\n.*?^\}", SOURCE, re.M | re.S).group()
 with tempfile.TemporaryDirectory() as directory:
@@ -49,3 +51,84 @@ with tempfile.TemporaryDirectory() as directory:
         run(prefix + isolated + "\ncheck_os", success=supported)
 assert not re.search(r"^\s*set\s+-(?:[^\s]*x)", SOURCE, re.M)
 print("PASS: help, argument values, OS compatibility and trace/token canary")
+
+# Isolated swap simulations: redirect only this helper's paths to a disposable
+# directory. No real mkswap/swapon or host configuration writes are performed.
+swap = re.search(r"^configure_swap\(\) \{\n.*?^\}", SOURCE, re.M | re.S).group()
+cases = (
+    ("create", "", "ok", "1 GiB active; persistent"),
+    ("xfs", "FS=xfs", "ok", "1 GiB active; persistent"),
+    ("active", "ACTIVE=/dev/zram0", "info", "existing swap preserved"),
+    ("noswap", "parse_args --noswap", "info", "skipped by --noswap"),
+    ("space", "FREE=4294967295", "warn", "less than 4 GiB free"),
+    ("filesystem", "FS=btrfs", "warn", "unsupported filesystem"),
+    ("mkswap", "FAIL_MKSWAP=1", "warn", "creation/activation failed"),
+    ("swapon", "FAIL_SWAPON=1", "warn", "creation/activation failed"),
+    ("inactive", 'printf foreign > "$SWAP_TEST_FILE"', "warn", "existing inactive"),
+    ("symlink", 'ln -s "$SWAP_TEST_DIR/foreign" "$SWAP_TEST_FILE"', "warn", "existing inactive"),
+    ("fstab", "printf '%s none swap sw 0 0\\n' \"$SWAP_TEST_FILE\" >> \"$SWAP_TEST_FSTAB\"",
+     "warn", "fstab entry"),
+    ("persistence", "FAIL_BACKUP=1", "warn", "persistence failed"),
+)
+with tempfile.TemporaryDirectory() as directory:
+    for name, setup, state, detail in cases:
+        path = pathlib.Path(directory) / name
+        path.mkdir()
+        helper = swap.replace("/swapfile", str(path / "swapfile"))
+        helper = helper.replace("/etc/fstab", str(path / "fstab"))
+        helper = helper.replace("/.swapfile-bootstrap.", str(path / ".swapfile-bootstrap."))
+        helper = helper.replace("/etc/.fstab-swap.", str(path / ".fstab-swap."))
+        mocks = r'''
+FS=ext4 FREE=4294967296 ACTIVE=''
+printf '# preserved fstab\n' > "$SWAP_TEST_FSTAB"
+printf foreign > "$SWAP_TEST_DIR/foreign"
+swapon() {
+  if [[ "$*" == '--show=NAME --noheadings' ]]; then printf '%s' "$ACTIVE"; return 0; fi
+  printf 'activate\n' >> "$SWAP_TEST_DIR/calls"
+  [[ ${FAIL_SWAPON:-0} == 0 ]] || return 1
+  ACTIVE=$1
+}
+findmnt() { printf '%s\n' "$FS"; }
+df() { printf 'Avail\n%s\n' "$FREE"; }
+fallocate() { printf allocated > "${@: -1}"; }
+chown() { :; }
+stat() { printf '1073741824:0:0:600\n'; }
+mkswap() { printf 'mkswap\n' >> "$SWAP_TEST_DIR/calls"; [[ ${FAIL_MKSWAP:-0} == 0 ]]; }
+backup_file() { [[ ${FAIL_BACKUP:-0} == 0 ]] && cp "$1" "$SWAP_TEST_DIR/backup"; }
+'''
+        result = run(prefix + helper + mocks + setup + r'''
+cp "$SWAP_TEST_FSTAB" "$SWAP_TEST_DIR/before"
+configure_swap
+[[ ${#FAILED_CHECKS[@]} == 0 ]]
+[[ ${SUMMARY_STATE[swap]} == "$SWAP_TEST_STATE" ]]
+[[ ${SUMMARY_DETAIL[swap]} == *"$SWAP_TEST_DETAIL"* ]]
+final_summary
+[[ $(cat "$SWAP_TEST_DIR/foreign") == foreign ]]
+if [[ ${SUMMARY_STATE[swap]} == ok ]]; then
+  [[ "$ACTIVE" == "$SWAP_TEST_FILE" ]]
+  [[ $(grep -Fc "$SWAP_TEST_FILE none swap sw 0 0" "$SWAP_TEST_FSTAB") == 1 ]]
+  cp "$SWAP_TEST_FSTAB" "$SWAP_TEST_DIR/after"
+  inode=$(command stat -c %i "$SWAP_TEST_FILE")
+  configure_swap
+  [[ ${SUMMARY_STATE[swap]} == info && $(command stat -c %i "$SWAP_TEST_FILE") == "$inode" ]]
+  cmp "$SWAP_TEST_DIR/after" "$SWAP_TEST_FSTAB"
+  [[ $(grep -c activate "$SWAP_TEST_DIR/calls") == 1 ]]
+else
+  cmp "$SWAP_TEST_DIR/before" "$SWAP_TEST_FSTAB"
+  [[ ${#WARNINGS[@]} -le 1 ]]
+  case "$SWAP_TEST_CASE" in
+    active|noswap|space|filesystem|inactive|symlink|fstab) [[ ! -e "$SWAP_TEST_DIR/calls" ]] ;;
+  esac
+  if [[ "$SWAP_TEST_CASE" == inactive ]]; then [[ $(cat "$SWAP_TEST_FILE") == foreign ]];
+  elif [[ "$SWAP_TEST_CASE" == symlink ]]; then [[ -L "$SWAP_TEST_FILE" ]];
+  elif [[ "$SWAP_TEST_CASE" == persistence ]]; then [[ -f "$SWAP_TEST_FILE" && "$ACTIVE" == "$SWAP_TEST_FILE" ]];
+  else [[ ! -e "$SWAP_TEST_FILE" ]]; fi
+fi
+[[ -z $(find "$SWAP_TEST_DIR" -name '.swapfile-bootstrap.*' -o -name '.fstab-swap.*') ]]
+''', env={"SWAP_TEST_DIR": str(path), "SWAP_TEST_FILE": str(path / "swapfile"),
+          "SWAP_TEST_FSTAB": str(path / "fstab"), "SWAP_TEST_STATE": state,
+          "SWAP_TEST_DETAIL": detail, "SWAP_TEST_CASE": name})
+        token = {"ok": "[✓]", "info": "[i]", "warn": "[!]"}[state]
+        assert re.search(re.escape(token) + r" Swap\s+.*" + re.escape(detail), result.stdout)
+        assert "RESULT: FAILED" not in result.stdout
+        print(f"PASS: swap SIMULATION {name}; summary and non-fatal result")

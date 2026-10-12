@@ -35,6 +35,9 @@ assert 'RESULT: SUCCESS WITH WARNINGS' in text or 'RESULT: SUCCESS\n' in text
 assert 'FAILED CHECK:' not in text
 if sys.argv[1].endswith('/initial.log'):
     assert 'Full upgrade and autoclean completed' in text, 'Default package upgrade not completed'
+    assert re.search(r'\[✓\] Swap\s+1 GiB active; persistent', text)
+else:
+    assert re.search(r'\[i\] Swap\s+existing swap preserved', text)
 allowed=(
  'No Ubuntu Pro token provided;', 'Automatic package removal skipped;',
  'A local key check cannot prove remote login.', 'Global DoT does not override',
@@ -113,10 +116,15 @@ verify() {
   [[ $(timedatectl show -p Timezone --value) == Europe/Moscow ]]
   pro status --format json | python3 -c 'import json,sys; assert json.load(sys.stdin)["attached"] is False'
   [[ -z $(dpkg --audit) ]]
+  [[ $(stat -c '%s:%u:%g:%a' /swapfile) == 1073741824:0:0:600 ]]
+  swapon --show=NAME --noheadings | grep -Fx /swapfile >/dev/null
+  [[ $(awk '$1 == "/swapfile" && $3 == "swap" {n++} END {print n+0}' /etc/fstab) == 1 ]]
+  [[ $(stat -c %i /swapfile) == "$(cat /root/ci-swap-inode)" ]]
+  echo 'PASS: real 1 GiB swap active; root:root 0600; persistent and same inode'
   echo 'PASS: real SSH/DoT/sysctl/UFW/Fail2ban/timers/Pro/dpkg state'
 }
 snapshot() {
-  sha256sum /root/.ssh/authorized_keys /etc/ssh/sshd_config /etc/default/ufw /etc/ufw/user.rules \
+  sha256sum /etc/fstab /root/.ssh/authorized_keys /etc/ssh/sshd_config /etc/default/ufw /etc/ufw/user.rules \
     /etc/ufw/user6.rules /etc/ssh/sshd_config.d/00-proms-hardening.conf \
     /etc/systemd/resolved.conf.d/90-proms-dot.conf /etc/sysctl.d/99-proms-network.conf \
     /etc/fail2ban/fail2ban.local /etc/fail2ban/jail.d/sshd.local \
@@ -142,7 +150,9 @@ case "$stage" in
     # Readiness is already established by cloud-init; this connection is a real assertion.
     ssh_test true >/dev/null
     cat /proc/sys/kernel/random/boot_id > /root/ci-boot-id
+    [[ -z $(swapon --show=NAME --noheadings) && ! -e /swapfile && ! -L /swapfile ]]
     bootstrap initial
+    stat -c %i /swapfile > /root/ci-swap-inode
     verify
     snapshot > /root/ci-before
     bootstrap rerun --no-upgrade

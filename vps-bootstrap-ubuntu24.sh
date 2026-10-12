@@ -21,6 +21,7 @@ AUTO_REBOOT_TIME="${AUTO_REBOOT_TIME:-04:38}"
 RUN_UPGRADE=1
 RUN_AUTOREMOVE=0
 CONFIGURE_DNS=1
+CONFIGURE_SWAP=1
 STATE_DIR=""
 TX_SERVICE=""
 TX_RECOVERY_INCOMPLETE=0
@@ -93,6 +94,7 @@ Options:
   --no-upgrade           Skip initial full upgrade and cleanup.
   --autoremove           Opt in to removing unused packages after upgrade.
   --skip-dns             Preserve current DNS configuration.
+  --noswap               Skip automatic 1 GiB swap creation; preserve existing swap.
   -h, --help             Show help.
 
 Environment overrides:
@@ -122,6 +124,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-upgrade)
       RUN_UPGRADE=0
+      shift
+      ;;
+    --noswap)
+      CONFIGURE_SWAP=0
       shift
       ;;
     -h|--help)
@@ -164,6 +170,86 @@ backup_file() {
   fi
 }
 
+
+configure_swap() {
+  local active filesystem available configured temporary='' fstab_temporary='' reason=''
+  if [[ "$CONFIGURE_SWAP" -eq 0 ]]; then
+    summary_set swap info "skipped by --noswap"
+    return 0
+  fi
+  if ! active=$(swapon --show=NAME --noheadings); then
+    reason='skipped; could not inspect active swap'
+  elif [[ -n "$active" ]]; then
+    summary_set swap info "existing swap preserved"
+    return 0
+  elif [[ -e /swapfile || -L /swapfile ]]; then
+    reason='skipped; existing inactive /swapfile requires manual review'
+  elif [[ ! -f /etc/fstab || -L /etc/fstab ]]; then
+    reason='skipped; /etc/fstab is not a regular non-symlink file'
+  elif ! configured=$(awk '$1 == "/swapfile" {print "configured"}' /etc/fstab); then
+    reason='skipped; could not read /etc/fstab'
+  elif [[ -n "$configured" ]]; then
+    reason='skipped; existing /swapfile fstab entry requires manual review'
+  elif ! filesystem=$(findmnt -n -o FSTYPE -T /); then
+    reason='skipped; could not determine filesystem'
+  elif [[ "$filesystem" != ext4 && "$filesystem" != xfs ]]; then
+    reason='skipped; unsupported filesystem'
+  elif ! available=$(df -B1 --output=avail / | awk 'NR == 2 {print $1}') ||
+       [[ ! "$available" =~ ^[0-9]+$ ]]; then
+    reason='skipped; could not determine free space'
+  elif (( available < 4294967296 )); then
+    reason='skipped; less than 4 GiB free'
+  fi
+  if [[ -n "$reason" ]]; then
+    warn "Swap: $reason"
+    summary_set swap warn "$reason"
+    return 0
+  fi
+
+  # Prepare allocated blocks on the destination filesystem; never overwrite a path.
+  if temporary=$(mktemp /.swapfile-bootstrap.XXXXXX) &&
+     chmod 600 "$temporary" && chown root:root "$temporary" &&
+     fallocate -l 1073741824 "$temporary" &&
+     [[ $(stat -c '%s:%u:%g:%a' "$temporary") == 1073741824:0:0:600 ]] &&
+     mkswap "$temporary" >/dev/null && ln -T -- "$temporary" /swapfile &&
+     swapon /swapfile; then
+    # Once activated, retain the file even if persistence fails; never swapoff.
+    if ! rm -- "$temporary"; then
+      reason='active; temporary file cleanup failed; review manually'
+    elif ! active=$(swapon --show=NAME --noheadings) ||
+         ! grep -Fxq /swapfile <<< "$active"; then
+      reason='activation could not be confirmed; file retained for manual review'
+    # Stage a minimal append on the same filesystem, using the existing backup helper.
+    elif ! (backup_file /etc/fstab) >/dev/null 2>&1 ||
+         ! fstab_temporary=$(mktemp /etc/.fstab-swap.XXXXXX) ||
+         ! cp -p -- /etc/fstab "$fstab_temporary" ||
+         ! printf '\n/swapfile none swap sw 0 0\n' >> "$fstab_temporary" ||
+         ! mv -Tf -- "$fstab_temporary" /etc/fstab; then
+      reason='1 GiB active; persistence failed; review /etc/fstab manually'
+    elif ! configured=$(awk '$1 == "/swapfile" && $3 == "swap" {n++} END {print n+0}' /etc/fstab) ||
+         [[ "$configured" != 1 ]]; then
+      reason='1 GiB active; persistence not confirmed; review /etc/fstab manually'
+    else
+      summary_set swap ok "1 GiB active; persistent"
+      return 0
+    fi
+  else
+    reason='skipped; creation/activation failed'
+    # Remove only this invocation's newly published inode, never a competing file.
+    if [[ -n "$temporary" && ! -L /swapfile && "$temporary" -ef /swapfile ]]; then
+      if ! rm -- /swapfile; then reason+='; unfinished file cleanup failed'; fi
+    fi
+    if [[ -n "$temporary" ]]; then
+      if ! rm -f -- "$temporary"; then reason+='; temporary cleanup failed'; fi
+    fi
+  fi
+  if [[ -n "$fstab_temporary" ]]; then
+    if ! rm -f -- "$fstab_temporary"; then reason+='; fstab temporary cleanup failed'; fi
+  fi
+  warn "Swap: $reason"
+  summary_set swap warn "$reason"
+  return 0
+}
 
 # Move only backups with the exact old bootstrap naming scheme and known paths.
 # Unknown administrator backup files are never glob-deleted or modified.
@@ -1843,6 +1929,7 @@ final_summary() {
       printf ' %s%s%s %-22s %s\n' "$color" "$token" "$reset" "$label" "$detail"
     done <<'ROWS'
 os OS
+swap Swap
 upgrade System upgrade
 keys SSH keys
 policy SSH policy
@@ -1993,6 +2080,7 @@ main() {
   flock -n 9 || die "Another bootstrap instance is running"
   STATE_DIR="$(mktemp -d /run/vps-bootstrap-proms.XXXXXX)"
   chmod 700 "$STATE_DIR"
+  configure_swap
   provision_proms_ssh_keys
   migrate_legacy_backups
   check_root_authorized_keys
