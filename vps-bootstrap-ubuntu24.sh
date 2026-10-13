@@ -22,6 +22,10 @@ RUN_UPGRADE=1
 RUN_AUTOREMOVE=0
 CONFIGURE_DNS=1
 CONFIGURE_SWAP=1
+CONFIGURE_PRO=1
+RUN_REBOOT=0
+BOOTSTRAP_COMPLETED=0
+BOOTSTRAP_ABORTED=0
 STATE_DIR=""
 TX_SERVICE=""
 TX_RECOVERY_INCOMPLETE=0
@@ -49,7 +53,7 @@ PROVIDER_IPV6=not-tested
 IPV4_FALLBACK=not-used
 declare -A APT_UNIT_ENABLED=() APT_UNIT_ACTIVE=()
 
-trap 'printf "ERROR at line %s (command omitted to protect secrets)\n" "$LINENO" >&2' ERR
+trap 'BOOTSTRAP_ABORTED=1; printf "ERROR at line %s (command omitted to protect secrets)\n" "$LINENO" >&2' ERR
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'finish' EXIT
@@ -95,6 +99,8 @@ Options:
   --autoremove           Opt in to removing unused packages after upgrade.
   --skip-dns             Preserve current DNS configuration.
   --noswap               Skip automatic 1 GiB swap creation; preserve existing swap.
+  --nopro                Skip Ubuntu Pro setup without changing any subscription.
+  --reboot               Schedule reboot in 30 seconds after successful cleanup, if required.
   -h, --help             Show help.
 
 Environment overrides:
@@ -128,6 +134,14 @@ while [[ $# -gt 0 ]]; do
       ;;
     --noswap)
       CONFIGURE_SWAP=0
+      shift
+      ;;
+    --nopro)
+      CONFIGURE_PRO=0
+      shift
+      ;;
+    --reboot)
+      RUN_REBOOT=1
       shift
       ;;
     -h|--help)
@@ -342,7 +356,7 @@ rollback_transaction() {
 }
 
 finish() {
-  local rc=$?
+  local rc=$? pending_transaction="$TX_SERVICE"
   trap - EXIT
   cleanup_ipv6_guard || rc=1
   if [[ -n "$TX_SERVICE" ]]; then
@@ -352,7 +366,24 @@ finish() {
     fi
   fi
   if [[ -n "$STATE_DIR" && ! -f "$STATE_DIR/ipv6-route-owned" ]]; then
-    rm -rf -- "$STATE_DIR"
+    rm -rf -- "$STATE_DIR" || rc=1
+  fi
+  # Only a completed main/report and successful EXIT cleanup may request reboot.
+  if (( RUN_REBOOT && BOOTSTRAP_COMPLETED && ! BOOTSTRAP_ABORTED && rc == 0 &&
+        ! TX_RECOVERY_INCOMPLETE && ${#FAILED_CHECKS[@]} == 0 && ${#TX_FILES[@]} == 0 )) &&
+     [[ -z "$pending_transaction" && -z "$TX_SERVICE" &&
+        ! -f "$STATE_DIR/ipv6-route-owned" ]]; then
+    if [[ ! -f /run/reboot-required ]]; then
+      echo "Automatic reboot skipped: not required."
+    elif systemctl is-active --quiet vps-bootstrap-reboot.timer; then
+      echo "Automatic reboot already scheduled; existing timer preserved."
+    elif systemd-run --unit=vps-bootstrap-reboot --on-active=30s \
+         --timer-property=AccuracySec=1s /usr/bin/systemctl reboot; then
+      echo "Automatic reboot scheduled in 30 seconds."
+    else
+      printf 'ERROR: Could not schedule automatic reboot; no immediate reboot performed.\n' >&2
+      rc=1
+    fi
   fi
   exit "$rc"
 }
@@ -776,6 +807,11 @@ PY
 }
 
 configure_ubuntu_pro() {
+  if [[ "$CONFIGURE_PRO" -eq 0 ]]; then
+    unset UBUNTU_PRO_TOKEN
+    summary_set pro info "skipped by --nopro"
+    return 0
+  fi
   log "Check Ubuntu Pro attachment, ESM Infra, ESM Apps and Livepatch"
   local token="${UBUNTU_PRO_TOKEN:-}" status attached service state
   unset UBUNTU_PRO_TOKEN
@@ -2101,6 +2137,7 @@ main() {
   configure_fail2ban
   # An expected FAILED CHECK is not an unexpected command failure.
   if final_report; then
+    BOOTSTRAP_COMPLETED=1
     return 0
   else
     exit 1
