@@ -26,11 +26,31 @@ are uploaded; the failure reporter does not dump journal, tokens or key bodies.
 injected while the real production DNS transaction restores actual guest files
 and restarts the service. It is not presented as a network outage integration test.
 The fast Python suite isolates argument/OS validation; it does not claim to replace
-VM integration. The existing production ShellCheck SC2004 arithmetic-index style
-finding is excluded explicitly; all other production findings and guest findings
+VM integration. Fast tests also simulate swap failures/idempotence, Pro skipping,
+reboot scheduling and diagnostic redaction. The existing production ShellCheck
+SC2004 arithmetic-index style finding is excluded explicitly; all other production findings and guest findings
 remain blocking.
 
 Limits: these VMs exercise ext4, QEMU NAT, the supplied kernel and no Pro subscription;
 they do not prove provider-specific networking or an interactive FIDO login.
 They do verify both required FIDO public identities remain accepted by OpenSSH.
-Swap coverage belongs to the subsequent feature PR after this CI stage is approved.
+Real swap checks require a 1 GiB active root:root 0600 file, one fstab entry and
+the same inode on rerun/reboot. XFS and negative creation paths use isolated
+simulations; these are not presented as real XFS activation tests.
+
+Basic checks also run `check_commit_metadata.py` and `test_commit_metadata.py`.
+The checker validates author/committer only in the trusted full PR base..head
+range, with complete history and a 1000-new-commit limit. Missing objects/shallow
+history fail PR validation. Maintainer public identities and narrow GitHub
+noreply/web/bot formats are accepted; rejected values are not printed. This is
+a privacy convention, not proof of account ownership. Push events explicitly
+skip historical metadata validation. Tests use synthetic repositories/identities.
+For a local range check, use full commit SHAs:
+
+```bash
+python3 tests/ci/check_commit_metadata.py --event pull_request \
+  --base "$BASE_SHA" --head "$HEAD_SHA"
+```
+
+The check feeds the existing Required aggregation; it does not configure GitHub
+branch protection or change the VM matrix.
