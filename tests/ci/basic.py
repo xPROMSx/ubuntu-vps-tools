@@ -172,3 +172,86 @@ with tempfile.TemporaryDirectory() as directory:
         output = run("python3 -c " + shlex.quote(isolated), success=success).stdout
         assert expected in output and 'PRIVATE_DIAG_CANARY' not in output
     print('PASS: guest assertion labels, strict swap success requirement and diagnostic redaction')
+
+for args in ('--reboot', '--nopro', '--reboot --nopro', '--nopro --reboot'):
+    run(prefix + f'parse_args {args}; '
+        f'[[ $RUN_REBOOT == {int("--reboot" in args)} && $CONFIGURE_PRO == {int("--nopro" not in args)} ]]')
+help_text = run(f'bash {SCRIPT} --help').stdout
+assert '--reboot' in help_text and '--nopro' in help_text
+run(prefix + 'parse_args --reboot --nopro --noswap --no-upgrade --autoremove --skip-dns; '
+    '[[ $RUN_REBOOT == 1 && $CONFIGURE_PRO == 0 && $CONFIGURE_SWAP == 0 && '
+    '$RUN_UPGRADE == 0 && $RUN_AUTOREMOVE == 1 && $CONFIGURE_DNS == 0 ]]')
+with tempfile.TemporaryDirectory() as directory:
+    state = pathlib.Path(directory) / 'pro-state'
+    state.write_text('existing subscription')
+    run(prefix + 'pro() { printf changed > "$PRO_TEST_STATE"; return 99; }; '
+        'read() { exit 99; }; parse_args --nopro; configure_ubuntu_pro; '
+        '[[ ${SUMMARY_STATE[pro]} == info && ${SUMMARY_DETAIL[pro]} == "skipped by --nopro" && '
+        '${#WARNINGS[@]} == 0 && ${#FAILED_CHECKS[@]} == 0 && -z ${UBUNTU_PRO_TOKEN+x} ]]; unset -f read; final_summary',
+        env={'UBUNTU_PRO_TOKEN': 'CI_SECRET_CANARY', 'PRO_TEST_STATE': str(state)})
+    assert state.read_text() == 'existing subscription'
+print('PASS: reboot/nopro arguments and non-interactive Pro preservation')
+
+# Execute the real EXIT handler with only mock cleanup/systemd operations.
+finish = re.search(r'^finish\(\) \{\n.*?^\}', SOURCE, re.M | re.S).group()
+cases = (
+    ('default', 'RUN_REBOOT=0', 0, False),
+    ('success', '', 0, True),
+    ('warnings', 'WARNINGS=(optional)', 0, True),
+    ('unfinished', 'BOOTSTRAP_COMPLETED=0', 0, False),
+    ('failed-check', 'FAILED_CHECKS=(failed)', 0, False),
+    ('error', 'set +e; false; set -e', 0, False),
+    ('exit-failure', 'exit 1', 1, False),
+    ('sigint', 'kill -s INT $$', 130, False),
+    ('sigterm', 'kill -s TERM $$', 143, False),
+    ('cleanup-failure', 'FAIL_CLEANUP=1', 1, False),
+    ('cleanup-marker', 'touch "$STATE_DIR/ipv6-route-owned"', 0, False),
+    ('remove-failure', 'FAIL_REMOVE=1', 1, False),
+    ('rollback-failure', 'TX_SERVICE=dns; FAIL_ROLLBACK=1', 1, False),
+    ('pending-transaction', 'TX_SERVICE=dns', 0, False),
+    ('pending-files', 'TX_FILES=(config)', 0, False),
+    ('incomplete-recovery', 'TX_RECOVERY_INCOMPLETE=1', 0, False),
+    ('not-required', 'rm "$REBOOT_TEST_DIR/required"', 0, False),
+    ('schedule-failure', 'FAIL_SCHEDULE=1', 1, True),
+)
+with tempfile.TemporaryDirectory() as directory:
+    for name, setup, rc, schedules in cases:
+        path = pathlib.Path(directory) / name
+        path.mkdir()
+        (path / 'required').touch()
+        handler = finish.replace('/run/reboot-required', str(path / 'required'))
+        mocks = r'''
+RUN_REBOOT=1 BOOTSTRAP_COMPLETED=1
+STATE_DIR="$REBOOT_TEST_DIR/state"
+mkdir -p "$STATE_DIR"
+cleanup_ipv6_guard() { echo cleanup >> "$REBOOT_TEST_DIR/calls"; [[ ${FAIL_CLEANUP:-0} == 0 ]]; }
+rollback_transaction() {
+  echo rollback >> "$REBOOT_TEST_DIR/calls"
+  [[ ${FAIL_ROLLBACK:-0} == 0 ]] || return 1
+  TX_SERVICE=''; TX_FILES=()
+}
+rm() { [[ ${FAIL_REMOVE:-0} == 0 ]] || return 1; command rm "$@"; }
+systemctl() { [[ "$*" == 'is-active --quiet vps-bootstrap-reboot.timer' ]]; [[ -f "$REBOOT_TEST_DIR/timer" ]]; }
+systemd-run() {
+  [[ "$*" == '--unit=vps-bootstrap-reboot --on-active=30s --timer-property=AccuracySec=1s /usr/bin/systemctl reboot' ]] || exit 99
+  [[ ! -e "$STATE_DIR" ]] || exit 99
+  echo schedule >> "$REBOOT_TEST_DIR/calls"
+  [[ ${FAIL_SCHEDULE:-0} == 0 ]] || return 1
+  touch "$REBOOT_TEST_DIR/timer"
+}
+'''
+        code = prefix + handler + mocks + 'trap finish EXIT; ' + (setup or ':') + '; :'
+        result = run(code, success=(rc == 0), env={'REBOOT_TEST_DIR': str(path)})
+        assert result.returncode == rc
+        calls = (path / 'calls').read_text().splitlines()
+        assert ('schedule' in calls) == schedules
+        if name == 'schedule-failure':
+            assert 'Could not schedule' in result.stderr and 'scheduled in 30 seconds' not in result.stdout
+        elif schedules:
+            assert 'Automatic reboot scheduled in 30 seconds.' in result.stdout
+            again = run(code, env={'REBOOT_TEST_DIR': str(path)})
+            assert 'existing timer preserved' in again.stdout
+            assert (path / 'calls').read_text().splitlines().count('schedule') == 1
+        elif name == 'not-required':
+            assert 'Automatic reboot skipped: not required.' in result.stdout
+        print(f'PASS: reboot MOCK {name}; cleanup gating and timer behavior')
