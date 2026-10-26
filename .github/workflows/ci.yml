@@ -27,6 +27,9 @@ jobs:
       - run: |
           bash -n vps-bootstrap-ubuntu24.sh
           bash -n tests/ci/guest.sh
+          bash -n update-sshid
+          shellcheck update-sshid
+          python3 tests/ci/test_update_sshid.py
           # Existing baseline SC2004 is an arithmetic-index style nit only.
           shellcheck --exclude=SC2004 vps-bootstrap-ubuntu24.sh
           shellcheck tests/ci/guest.sh
