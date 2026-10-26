@@ -9,7 +9,39 @@ TX_KEEP=0
 VALID_KEY_TYPES=()
 DETECTED_SSH_PORTS=()
 SSH_CONTEXTS=()
-usage() { echo 'Usage: sudo bash update-sshid [--nopass | --help]'; echo 'Replace all root authorized_keys with the bootstrap managed key set; --nopass also applies key-only SSH policy.'; }
+usage() {
+  printf '%s\n' 'Usage: sudo bash update-sshid' '       bash update-sshid --help' \
+    'Interactive menu: 1) update managed root keys only; 2) update keys and disable SSH passwords; 3) exit.' \
+    'Both working options replace all foreign root authorized_keys entries.'
+}
+
+select_action() {
+  local choice input_fd=0
+  trap 'exit 130' INT
+  if [[ ! -t 0 ]]; then
+    if ! { exec 7</dev/tty; } 2>/dev/null || [[ ! -t 7 ]]; then
+      echo 'ERROR: Interactive terminal required; no action performed.' >&2
+      return 1
+    fi
+    input_fd=7
+  fi
+  printf '%s\n' '========================================' '             SSH Key Manager' \
+    '========================================' '' '1) Обновить ключи SSH ID' \
+    '2) Отключить вход по паролю' '3) Выход' ''
+  while :; do
+    printf 'Выберите действие [1-3]: '
+    if ! IFS= read -r -u "$input_fd" choice; then
+      echo 'Input closed; no action performed.' >&2
+      return 1
+    fi
+    case "$choice" in
+      1) NOPASS=0; return 0 ;;
+      2) NOPASS=1; return 0 ;;
+      3) echo 'Выход.'; return 3 ;;
+      *) echo 'Неверный выбор. Введите 1, 2 или 3.' ;;
+    esac
+  done
+}
 
 update_keys() {
 set -Eeuo pipefail
@@ -36,7 +68,7 @@ trap cleanup EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-[[ $EUID -eq 0 ]] || die 'Run update-sshid-proms as root'
+[[ $EUID -eq 0 ]] || die 'Run update-sshid as root'
 
 for cmd in curl ssh-keygen flock mktemp install cmp cp mv chmod chown grep tr date; do
   command -v "$cmd" >/dev/null || die "Required command not found: $cmd"
@@ -357,6 +389,9 @@ finish_update() {
     fi
     rc=1
   fi
+  if (( rc != 0 && NOPASS )); then
+    echo 'ERROR: Keys were updated, but SSH hardening did not complete successfully.' >&2
+  fi
   if (( ! TX_KEEP )); then cleanup; fi
   exit "$rc"
 }
@@ -407,15 +442,17 @@ EOF
 }
 
 main() {
-  local help=0
+  local help=0 selection=0
   for arg in "$@"; do
     case "$arg" in
-      --nopass) NOPASS=1 ;;
       --help) help=1 ;;
       *) echo 'ERROR: unknown argument; use --help' >&2; return 1 ;;
     esac
   done
   if (( help )); then usage; return 0; fi
+  select_action || selection=$?
+  if (( selection == 3 )); then return 0; fi
+  (( selection == 0 )) || return "$selection"
   [[ $EUID -eq 0 ]] || { echo 'ERROR: Run as root' >&2; return 1; }
   # shellcheck disable=SC1091
   . /etc/os-release
@@ -430,7 +467,10 @@ main() {
   fi
   update_keys
   trap finish_update EXIT
-  if (( NOPASS )); then harden_ssh; fi
+  if (( NOPASS )); then
+    harden_ssh
+    echo 'SSH password login disabled; managed key-only policy verified.'
+  fi
   echo 'WARNING: Test a new key login in a second SSH session before closing this connection; local validation cannot prove external access.'
 }
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

@@ -1,5 +1,10 @@
 """Isolated updater regressions; no host SSH/systemd changes."""
+import errno
+import os
 import pathlib
+import pty
+import select
+import time
 import re
 import subprocess
 import tempfile
@@ -15,6 +20,7 @@ with tempfile.TemporaryDirectory() as directory:
         return (text.replace('/root/.ssh', str(root / 'ssh'))
                 .replace('/root/backups', str(root / 'backups'))
                 .replace('/etc/ssh', str(root / 'etc'))
+                .replace('/run/lock/vps-bootstrap-proms.lock', str(root / 'bootstrap.lock'))
                 .replace('[[ $EUID -eq 0 ]]', 'true'))
     script = root / 'updater'
     script.write_text(mapped(SOURCE))
@@ -76,8 +82,73 @@ trap finish_update EXIT;
     isolated = mapped(SOURCE).replace('. /etc/os-release', 'ID=ubuntu VERSION_ID=24.04 VERSION_CODENAME=noble')
     script.write_text(isolated)
     payload.write_text((root/'key.pub').read_text())
-    run(pre + 'harden_ssh() { exit 99; }; main')
+    run(pre + 'select_action() { NOPASS=0; }; harden_ssh() { exit 99; }; main')
     assert config.read_text() == '# original\n'
+    # Real menu in a controlling PTY; only the operations/dependencies are mocked.
+    calls = root/'menu-calls'
+    menu = pre + f'''
+update_keys() {{ echo keys >> {calls}; [[ ${{KEY_FAIL:-0}} == 0 ]]; }}
+harden_ssh() {{ echo hardening >> {calls}; [[ ${{HARDEN_FAIL:-0}} == 0 ]]; }}
+finish_update() {{ :; }}
+command() {{ if [[ $1 == -v ]]; then return 0; fi; builtin command "$@"; }}
+flock() {{ :; }}
+'''
+    def terminal(code, answer, expected=0):
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvp('bash', ['bash', '-c', code])
+        output = b''
+        sent = False
+        deadline = time.monotonic() + 10
+        try:
+            while time.monotonic() < deadline:
+                if select.select([fd], [], [], 0.1)[0]:
+                    try:
+                        chunk = os.read(fd, 4096)
+                    except OSError as exc:
+                        if exc.errno == errno.EIO:
+                            break
+                        raise
+                    if not chunk:
+                        break
+                    output += chunk
+                    if not sent and b'[1-3]:' in output:
+                        os.write(fd, answer)
+                        sent = True
+            else:
+                raise AssertionError('menu test timed out')
+        finally:
+            os.close(fd)
+            if time.monotonic() >= deadline:
+                os.kill(pid, 9)
+            _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == expected, output.decode(errors='replace')
+        return output
+
+    for answer, expected_calls, status, extra in (
+        (b'1\n', 'keys\n', 0, ''),
+        (b'2\n', 'keys\nhardening\n', 0, ''),
+        (b'2\n', 'keys\n', 1, 'KEY_FAIL=1; '),
+        (b'3\n', '', 0, ''),
+        (b'wrong\n\n3\n', '', 0, ''),
+        (b'\x04', '', 1, ''),
+        (b'\x03', '', 130, ''),
+    ):
+        calls.write_text('')
+        terminal(menu + extra + 'main', answer, status)
+        assert calls.read_text() == expected_calls
+    calls.write_text('')
+    terminal(menu + 'exec 0</dev/null; main', b'1\n')
+    assert calls.read_text() == 'keys\n'  # controlling /dev/tty fallback
+    calls.write_text('')
+    # A new session has neither terminal stdin nor a controlling terminal.
+    no_tty = subprocess.run(['bash', '-c', menu + 'main'], input='1\n',
+                            capture_output=True, text=True, start_new_session=True)
+    assert no_tty.returncode != 0 and 'Interactive terminal required' in no_tty.stderr
+    assert calls.read_text() == ''
+    for args, ok in (('--help', True), ('--nopass', False), ('--unknown', False)):
+        run(menu + 'main ' + args, ok)
+        assert calls.read_text() == ''
     run(pre + 'main --unknown', False)
     run(pre + 'main --help')
     run(pre + 'main --help --unknown', False)
@@ -98,8 +169,10 @@ apply_ssh_runtime_config
         run(runtime, ok)
         assert log.read_text().count('reload') == reloads
     config.write_text('# original\n')
-    recovery = run(mock + 'apply_ssh_runtime_config() { return 1; }; harden_ssh', False)
+    recovery = run(mock + 'NOPASS=1; apply_ssh_runtime_config() { return 1; }; harden_ssh', False)
     assert 'recovery incomplete' in recovery.stderr
+    assert 'Keys were updated, but SSH hardening did not complete successfully' in recovery.stderr
+    assert keys.read_bytes() == first
     assert config.read_text() == '# original\n'
 
-print('PASS: key format/bootstrap compatibility, dedup, foreign removal, idempotence, failure preservation, CLI and SSH rollback mocks')
+print('PASS: key format/bootstrap compatibility, dedup, foreign removal, idempotence, failure preservation, interactive menu/EOF/interrupt/TTY, CLI and SSH rollback mocks')

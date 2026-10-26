@@ -15,12 +15,25 @@ all foreign/provider authorized_keys entries, backing up the previous file.
 It does not install packages or replace the bootstrap's installed updater.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/xPROMSx/ubuntu-vps-tools/main/update-sshid -o /tmp/update-sshid && sudo bash /tmp/update-sshid
-# Optional: apply the bootstrap's root key-only SSH policy after key validation.
-curl -fsSL https://raw.githubusercontent.com/xPROMSx/ubuntu-vps-tools/main/update-sshid -o /tmp/update-sshid && sudo bash /tmp/update-sshid --nopass
+(
+  script=$(mktemp) || exit 1
+  trap 'rm -f -- "$script"' EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  curl -fsSL https://raw.githubusercontent.com/xPROMSx/ubuntu-vps-tools/main/update-sshid -o "$script" &&
+    bash -n "$script" && sudo bash "$script"
+)
 ```
 
-Without `--nopass`, sshd configuration is untouched. With it, conflicting policy
-or runtime application triggers SSH configuration recovery. Verify a new key
-login in a second SSH session before closing the current one. These main URLs
-become available after this file is merged; do not run installation on a development host.
+The interactive menu offers:
+
+1. Update managed SSH keys only; sshd configuration stays unchanged.
+2. Update keys, then disable SSH password login using the bootstrap's policy.
+   Conflicting policy or failed runtime application triggers SSH configuration recovery.
+3. Exit without changes.
+
+Both working options remove foreign/provider keys from `authorized_keys`.
+On first use, verify a new key login in a second SSH session before closing the
+current one. An interactive terminal is required; `--help` shows usage and
+`--nopass` is no longer accepted. The main URL becomes available after merge;
+do not run installation on a development host.
