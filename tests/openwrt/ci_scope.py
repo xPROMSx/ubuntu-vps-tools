@@ -17,7 +17,8 @@ if __name__ == '__main__':
     paths = []
     if event == 'pull_request':
         # The preceding metadata check validates the trusted full endpoints.
-        data = subprocess.check_output(['git', 'diff', '--name-only', '-z',
+        # Include both deleted and added paths when a file crosses scope by rename.
+        data = subprocess.check_output(['git', 'diff', '--no-renames', '--name-only', '-z',
                                         os.environ['PR_BASE_SHA'] + '...' + os.environ['PR_HEAD_SHA']])
         paths = [p.decode('utf-8') for p in data.split(b'\0') if p]
     value = str(requires_ubuntu_vm(paths, event)).lower()

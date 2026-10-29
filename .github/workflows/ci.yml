@@ -53,7 +53,7 @@ jobs:
           ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - name: Install shell validation tools
-        run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
+        run: sudo apt-get update && sudo apt-get install -y busybox-static shellcheck
       - run: |
           busybox ash -n openwrt/passwall2-apk-repo.sh
           shellcheck -s sh openwrt/passwall2-apk-repo.sh

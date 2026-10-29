@@ -212,13 +212,17 @@ select_targets() {
     fi
     XR_ACTION="подходит (upstream minimum $MIN_XRAY); сохранить бинарник"
     if [ "$needed" = 1 ]; then
-        [ "$XR_PATH" = /usr/bin/xray ] && [ ! -L /usr/bin/xray ] || block 'Xray needs repair at a custom path/symlink; review App Update settings manually.'
+        if [ "$XR_PATH" != /usr/bin/xray ] || [ -L /usr/bin/xray ]; then
+            block 'Xray needs repair at a custom path/symlink; review App Update settings manually.'
+        fi
         [ -n "$XR_AVAIL" ] || block 'No signed Xray package available.'
         [ "$(compare "${XR_AVAIL%-r*}" "$MIN_XRAY")" != '<' ] || block 'Signed Xray package is below the candidate requirement.'
         [ -z "$XR_INST" ] || [ "$(compare "$XR_INST" "$XR_AVAIL")" != '>' ] || block 'Xray APK downgrade blocked.'
         # A missing binary with unchanged APK metadata needs apk fix, not add.
         if [ "$XR_INST" = "$XR_AVAIL" ]; then
-            [ "$MODE" = install ] && [ ! -s "$WORK/targets" ] || block 'Repair the missing/old Xray binary with install first, then update PassWall2.'
+            if [ "$MODE" != install ] || [ -s "$WORK/targets" ]; then
+                block 'Repair the missing/old Xray binary with install first, then update PassWall2.'
+            fi
             COMMIT=fix
         fi
         XRAY_CHANGE=1
@@ -282,16 +286,19 @@ check_plan() {
                 block "Excluded optional component required by APK plan: $pkg";;
             busybox|apk*|libc|musl*|firewall*|nftables*|dropbear*|openssh*|hostapd*|wpad*|kernel|base-files|netifd|procd*|ubus*|libubus*|libubox*|libblobmsg-json*|uci|libuci*|odhcp*|ppp*|rpcd)
                 # libuci-lua is a mandatory LuCI binding, not libuci itself.
-                [ "$pkg" = libuci-lua ] && [ "$action" = Installing ] || block "System/network package change blocked: $pkg";;
+                if [ "$pkg" != libuci-lua ] || [ "$action" != Installing ]; then block "System/network package change blocked: $pkg"; fi;;
             kmod-*)
                 case "$pkg" in kmod-nft-socket|kmod-nft-tproxy|kmod-nft-nat|kmod-nf-socket|kmod-nf-tproxy|kmod-nf-nat) ;; *) block "Unreviewed kernel module: $pkg";; esac
-                [ "$MODE" = install ] && [ "$action" = Installing ] || block "Installed kernel module change blocked: $pkg";;
-            dnsmasq*) [ "$MODE" = install ] && [ "$pkg" = dnsmasq-full ] && [ "$action" = Installing ] || block 'DNS changes require install and a reviewed variant replacement.';;
+                if [ "$MODE" != install ] || [ "$action" != Installing ]; then block "Installed kernel module change blocked: $pkg"; fi;;
+            dnsmasq*)
+                if [ "$MODE" != install ] || [ "$pkg" != dnsmasq-full ] || [ "$action" != Installing ]; then
+                    block 'DNS changes require install and a reviewed variant replacement.'
+                fi;;
             xray-core) [ "$XRAY_CHANGE" = 1 ] || block 'APK would replace a suitable Xray runtime; review package dependencies manually.';;
         esac
         grep -Fxq "$pkg" "$WORK/dependencies" || block "Package outside requested dependency closure: $pkg"
         if [ "$action" = Reinstalling ]; then
-            [ "$COMMIT" = fix ] && [ "$pkg" = xray-core ] || block "Unnecessary reinstallation: $pkg"
+            if [ "$COMMIT" != fix ] || [ "$pkg" != xray-core ]; then block "Unnecessary reinstallation: $pkg"; fi
         fi
     done < "$2"
 }
@@ -532,7 +539,8 @@ apply() {
     done < "$WORK/actions"
     [ "$(installed_version "$MAIN")" = "$TARGET_PW" ] || fail 'Installed PassWall2 does not match the plan.'
     actual=$(timeout 10 "$XR_PATH" version 2>/dev/null | awk '$1=="Xray" {print $2; exit}')
-    valid_version "$actual" && [ "$(compare "$actual" "$MIN_XRAY")" != '<' ] || fail 'Xray runtime verification failed.'
+    valid_version "$actual" || fail 'Xray runtime verification failed.'
+    [ "$(compare "$actual" "$MIN_XRAY")" != '<' ] || fail 'Xray runtime verification failed.'
     if [ "$XRAY_CHANGE" = 0 ]; then
         [ "$actual" = "$XR_RUNTIME" ] || fail 'A suitable Xray runtime changed unexpectedly.'
         [ "$(sha "$XR_PATH")" = "$(cat "$WORK/xray-hash")" ] || fail 'A suitable Xray binary changed unexpectedly.'
