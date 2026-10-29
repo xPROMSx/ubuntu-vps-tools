@@ -34,9 +34,11 @@ current behavior from the older baseline. Keep both guides consistent.
 
 The script parses arguments, requires root, validates inputs and the exact OS
 version/codename, acquires the existing flock and creates its temporary state
-directory. Swap runs first, followed by managed key provisioning before lengthy
-package work or SSH/firewall changes. Base packages, provider connectivity,
-timezone/Pro, upgrades, systemd verification, SSH, resolver, sysctl, unattended
+directory. Managed key provisioning, checks and backups precede swap and the
+initial no-remove dist-upgrade. Base packages, provider connectivity, timezone
+and Pro follow. Refresh APT indexes after Pro and run a no-remove upgrade with
+new packages only for newly enabled and confirmed ESM repositories. APT cleanup,
+systemd verification, SSH, resolver, sysctl, unattended
 updates, UFW and Fail2ban follow. The detailed report and colored summary precede
 EXIT cleanup. `FAILED_CHECKS` and the original exit path decide success; the
 summary registry is presentation only. Expected warnings remain warnings.
@@ -91,8 +93,11 @@ Fail2ban keeps sshd in normal mode with systemd backend/nftables multiport actio
 Recidive stays disabled; stop only a surviving legacy recidive jail, not other
 jails. Do not add replacements or assume the external application jails exist.
 
-Base APT packages and index refreshes are distinct from the normally enabled
-no-remove dist-upgrade/autoclean stage. Autoremove is opt-in. Keep unattended
+The initial no-remove dist-upgrade precedes base packages and Pro. A second
+no-remove upgrade with new packages runs only when this run enabled and confirmed
+ESM repositories. Index refreshes and autoclean remain enabled with --no-upgrade.
+Autoremove is opt-in, runs at most once after base packages and required upgrades,
+including with --no-upgrade. Keep unattended
 updates and update/security/ESM origins, persistent APT timers at 02:30/02:50
 Europe/Moscow with no randomized delay, default timezone Europe/Moscow and the
 04:38 unattended reboot time. Package-triggered reboot policy remains separate
@@ -117,9 +122,10 @@ and do not change swappiness.
 ## Flags and reboot
 
 `--help`/`-h` show usage. `--ssh-port PORT` selects Fail2ban ports (default auto),
-not sshd listeners. `--no-upgrade` skips initial upgrade/cleanup, not base
-installation or later APT operations; `--autoremove` opts into removal in that
-upgrade stage. `--skip-dns` preserves resolver configuration. `--noswap` skips
+not sshd listeners. `--no-upgrade` skips both package upgrades, not base
+installation, index refreshes or Pro; `--autoremove` opts into removal once after
+base installation and upgrades. `--skip-dns` preserves resolver configuration.
+`--noswap` skips
 automatic swap creation and changes no existing swap/fstab. `--nopro` is an
 informational Pro skip. Argument order is arbitrary.
 
