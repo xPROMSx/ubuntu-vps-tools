@@ -411,18 +411,18 @@ backup() {
     BACKUP=/root/passwall2-apk-backup
     [ ! -e "$BACKUP" ] || block 'Move the previous /root/passwall2-apk-backup aside before another change.'
     mkdir "$BACKUP"
-    : > "$WORK/files"
     config_paths > "$WORK/config-paths"
     : > "$WORK/config-hashes"
+    set --
     while IFS= read -r path; do
-        printf '%s\n' "${path#/}" >> "$WORK/files"
+        set -- "$@" "${path#/}"
         if [ -d "$path" ]; then
             find "$path" -type f -exec sha256sum '{}' ';' >> "$WORK/config-hashes"
         else
             sha256sum "$path" >> "$WORK/config-hashes"
         fi
     done < "$WORK/config-paths"
-    tar -czf "$BACKUP/config.tgz" -C / -T "$WORK/files" || fail 'Cannot save configuration backup.'
+    tar -czf "$BACKUP/config.tgz" -C / "$@" || fail 'Cannot save configuration backup.'
     cp "$WORK/world-before" "$WORK/plan" "$BACKUP/"
     : > "$WORK/services"
     for svc in passwall2 passwall2_server dnsmasq; do

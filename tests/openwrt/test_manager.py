@@ -63,7 +63,12 @@ class ManagerTests(unittest.TestCase):
                 line = line.replace('${path#/}', '${path#"$PW_TEST_ROOT"/}')
             lines.append(line)
         self.script = self.root / 'manager.sh'
-        self.script.write_text(''.join(lines).replace(
+        # Some BusyBox builds prefer their own applets over PATH executables.
+        # Shell functions keep command doubles authoritative in both ash builds.
+        doubles = '\n'.join(f'{name}() {{ "$PW_TEST_ROOT/bin/{name}" "$@"; }}'
+                            for name in ['id', 'df', 'uci', 'apk', 'jsonfilter', 'wget'])
+        translated = ''.join(lines).replace('set -eu\n', 'set -eu\n' + doubles + '\n', 1)
+        self.script.write_text(translated.replace(
             '52802b143489214e13b78f96599a147a638205cc22d9dd6d71229504e38ddc00',
             hashlib.sha256(b'offline signing key fixture\n').hexdigest()))
         self.env = {**os.environ, 'PW_TEST_ROOT': str(self.root), 'PATH': str(self.root / 'bin') + ':' + os.environ['PATH']}
@@ -100,6 +105,13 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, self.output)
         for text in [PW, XR, '26.10.25', 'APK installed:', 'Runtime:', 'Result: Уже актуально', 'Commands:', 'sh /root/passwall2-apk-repo.sh check install']:
             self.assertIn(text, self.output)
+        self.assert_no_mutation()
+
+    def test_root_guard_is_preserved(self):
+        self.state['uid'] = 1000
+        result = self.run_manager('install')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Run as root.', self.output)
         self.assert_no_mutation()
 
     def test_absent_passwall_proposes_install(self):

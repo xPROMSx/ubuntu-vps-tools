@@ -47,7 +47,7 @@ def service(name, action):
 if command in state['services']:
     sys.exit(service(command, args[0]))
 if command == 'id':
-    print('0')
+    print(state.get('uid', 0))
 elif command == 'df':
     print('Filesystem 1024-blocks Used Available Capacity Mounted on')
     print('fixture 9999999 0 9999999 0% /')
