@@ -23,6 +23,7 @@ RUN_AUTOREMOVE=0
 CONFIGURE_DNS=1
 CONFIGURE_SWAP=1
 CONFIGURE_PRO=1
+ESM_REPOS_ENABLED=0
 RUN_REBOOT=0
 BOOTSTRAP_COMPLETED=0
 BOOTSTRAP_ABORTED=0
@@ -95,7 +96,7 @@ After bootstrap, refresh keys with: sudo update-sshid-proms
 
 Options:
   --ssh-port PORT        SSH port(s) for fail2ban only, comma-separated. Default: auto.
-  --no-upgrade           Skip initial full upgrade and cleanup.
+  --no-upgrade           Skip both package upgrades; keep base installation, APT indexes and Pro.
   --autoremove           Opt in to removing unused packages after upgrade.
   --skip-dns             Preserve current DNS configuration.
   --noswap               Skip automatic 1 GiB swap creation; preserve existing swap.
@@ -807,6 +808,7 @@ PY
 }
 
 configure_ubuntu_pro() {
+  ESM_REPOS_ENABLED=0
   if [[ "$CONFIGURE_PRO" -eq 0 ]]; then
     unset UBUNTU_PRO_TOKEN
     summary_set pro info "skipped by --nopro"
@@ -865,6 +867,9 @@ configure_ubuntu_pro() {
         return 0
       fi
       state="$(pro_field "$service" <<< "$status")"
+      if [[ "$state" == enabled && "$service" == esm-* ]]; then
+        ESM_REPOS_ENABLED=1
+      fi
     fi
     case "$state" in
       enabled) pass_check "Ubuntu Pro $service enabled" ;;
@@ -919,13 +924,12 @@ protect_manual_packages() {
   pass_check "Critical installed packages marked manual where present"
 }
 
-full_upgrade_and_cleanup() {
-  log "Full upgrade and cleanup"
+initial_full_upgrade() {
+  log "Initial full upgrade"
 
   if [[ "$RUN_UPGRADE" -ne 1 ]]; then
-    warn "Initial full-upgrade and cleanup were skipped by --no-upgrade"
+    warn "Package upgrades were skipped by --no-upgrade"
     summary_set upgrade warn "skipped by --no-upgrade"
-    summary_set autoremove warn "skipped with --no-upgrade"
     return 0
   fi
 
@@ -935,7 +939,10 @@ full_upgrade_and_cleanup() {
     -o Dpkg::Options::="--force-confdef" \
     -o Dpkg::Options::="--force-confold" \
     --no-remove -y dist-upgrade
+}
 
+apt_cleanup() {
+  log "APT cleanup"
   protect_manual_packages
 
   if [[ "$RUN_AUTOREMOVE" -eq 1 ]]; then
@@ -947,8 +954,10 @@ full_upgrade_and_cleanup() {
   fi
   apt-get -o DPkg::Lock::Timeout=600 -y autoclean
 
-  pass_check "Full upgrade and autoclean completed"
-  summary_set upgrade ok "upgrade and cleanup completed"
+  if [[ "$RUN_UPGRADE" -eq 1 ]]; then
+    pass_check "Full upgrade and autoclean completed"
+    summary_set upgrade ok "upgrade and cleanup completed"
+  fi
 }
 
 ssh_policy_ok() {
@@ -2117,17 +2126,24 @@ main() {
   flock -n 9 || die "Another bootstrap instance is running"
   STATE_DIR="$(mktemp -d /run/vps-bootstrap-proms.XXXXXX)"
   chmod 700 "$STATE_DIR"
-  configure_swap
   provision_proms_ssh_keys
   migrate_legacy_backups
   check_root_authorized_keys
+  configure_swap
+  initial_full_upgrade
   apt_install_base_packages
   configure_bootstrap_ipv4_fallback
   set_timezone
   configure_ubuntu_pro
   # Refresh indexes for newly enabled ESM repositories even with --no-upgrade.
   apt_update
-  full_upgrade_and_cleanup
+  if [[ "$ESM_REPOS_ENABLED" -eq 1 && "$RUN_UPGRADE" -eq 1 ]]; then
+    apt-get -o DPkg::Lock::Timeout=600 \
+      -o Dpkg::Options::="--force-confdef" \
+      -o Dpkg::Options::="--force-confold" \
+      upgrade --with-new-pkgs --no-remove -y
+  fi
+  apt_cleanup
   check_systemd_manager
   configure_ssh
   configure_resolved

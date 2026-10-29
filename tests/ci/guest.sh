@@ -90,7 +90,7 @@ allowed=(
  'No Ubuntu Pro token provided;', 'Automatic package removal skipped;',
  'A local key check cannot prove remote login.', 'Global DoT does not override',
  'Additional effective root SSH authority detected: authorizedkeyscommand /opt/ci/key-helper',
- 'Initial full-upgrade and cleanup were skipped by --no-upgrade',
+ 'Package upgrades were skipped by --no-upgrade',
  'Cannot inspect IPv6 configuration;', 'Provider IPv6 is configured but external IPv6',
  'Current/candidate SSH connection uses IPv6', 'Current SSH address family is unknown;',
  'Temporary IPv6 guard did not provide', 'BBR is not available in this kernel;',

@@ -60,8 +60,12 @@ or relax mandatory VM assertions to make a test pass.
   supplied token and enable supported services. `--nopro` skips setup and ignores
   the token without changing the subscription; base package installation and
   read-only final status reporting remain. Never log or trace credentials.
-- APT installs base packages, refreshes indexes and normally runs a no-remove
-  dist-upgrade and autoclean. Autoremove is opt-in. Unattended upgrades remain
+- After key provisioning/checks/backups and swap, APT normally runs a no-remove
+  dist-upgrade before base packages and Pro setup. Refresh indexes after Pro;
+  run a no-remove upgrade with new packages only if ESM repositories were newly
+  enabled and confirmed during this run. Autoclean follows package work;
+  autoremove runs at most once and only by explicit opt-in, including with
+  --no-upgrade. Unattended upgrades remain
   enabled with configured update/security/ESM origins; APT timers run at 02:30
   and 02:50 Europe/Moscow, persistent and without randomized delay. The default
   timezone is Europe/Moscow and unattended reboot time is 04:38. This package
@@ -94,8 +98,8 @@ or relax mandatory VM assertions to make a test pass.
 | --- | --- |
 | `--help`, `-h` | Usage only. |
 | `--ssh-port PORT` | Fail2ban port selection, not sshd listener reconfiguration; default auto. |
-| `--no-upgrade` | Skip initial full upgrade/cleanup, not base packages or later APT work. |
-| `--autoremove` | Explicit package-removal opt-in during the initial upgrade stage. |
+| `--no-upgrade` | Skip both package upgrades, not base packages, index refreshes or Pro. |
+| `--autoremove` | Explicit package-removal opt-in once after base packages and upgrades. |
 | `--skip-dns` | Preserve existing resolver configuration. |
 | `--noswap` | Skip automatic swap creation; preserve existing swap. |
 | `--nopro` | Informational Pro setup skip, no token prompt or attachment changes. |
