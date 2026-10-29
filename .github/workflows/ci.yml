@@ -13,6 +13,8 @@ jobs:
     name: Basic checks
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    outputs:
+      ubuntu_vm: ${{ steps.scope.outputs.ubuntu_vm }}
     steps:
       - uses: actions/checkout@v5
         with:
@@ -24,6 +26,12 @@ jobs:
           PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: python3 tests/ci/check_commit_metadata.py
+      - name: Determine Ubuntu VM scope
+        id: scope
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 tests/openwrt/ci_scope.py
       - run: |
           bash -n vps-bootstrap-ubuntu24.sh
           bash -n tests/ci/guest.sh
@@ -35,10 +43,27 @@ jobs:
           shellcheck tests/ci/guest.sh
           python3 tests/ci/basic.py
           python3 tests/ci/test_commit_metadata.py
+  openwrt:
+    name: OpenWrt offline checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install shell validation tools
+        run: sudo apt-get update && sudo apt-get install -y busybox shellcheck
+      - run: |
+          busybox ash -n openwrt/passwall2-apk-repo.sh
+          shellcheck -s sh openwrt/passwall2-apk-repo.sh
+          python3 -m unittest discover -s tests/openwrt -p 'test_*.py'
   vm:
     name: Ubuntu ${{ matrix.release }} VM
     runs-on: ubuntu-24.04
     timeout-minutes: 90
+    needs: basic
+    if: needs.basic.outputs.ubuntu_vm == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -63,11 +88,19 @@ jobs:
   required:
     name: Required
     if: always()
-    needs: [basic, vm]
+    needs: [basic, openwrt, vm]
     runs-on: ubuntu-24.04
     timeout-minutes: 2
     steps:
       - env:
           BASIC: ${{ needs.basic.result }}
+          OPENWRT: ${{ needs.openwrt.result }}
+          EXPECT_VM: ${{ needs.basic.outputs.ubuntu_vm }}
           VM: ${{ needs.vm.result }}
-        run: test "$BASIC" = success && test "$VM" = success
+        run: |
+          test "$BASIC" = success && test "$OPENWRT" = success
+          if [ "$EXPECT_VM" = false ]; then
+            test "$VM" = skipped
+          else
+            test "$EXPECT_VM" = true && test "$VM" = success
+          fi
