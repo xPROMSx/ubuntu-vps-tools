@@ -101,6 +101,12 @@ These mocks do not prove real OpenWrt behavior.
   reboot. No automatic installer reboot occurs without the flag. Test it only
   with mocks; do not use it to reboot a runner or add VM reboot scenarios.
 
+Ubuntu Pro token input occurs once after root/input/OS validation, before bootstrap
+work. Keep inherited tokens shell-local from startup; never export them to early
+APT children. Empty/EOF input skips attachment without a later prompt. Pro status,
+attachment and service activation stay after the initial upgrade/base packages;
+already attached systems never reattach even with a pre-collected token.
+
 ## CLI and subsystem reading
 
 With no arguments and TTY stdin/stdout, a one-shot menu selects the existing

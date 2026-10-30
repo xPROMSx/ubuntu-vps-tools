@@ -290,12 +290,13 @@ final_report() {{ printf 'report\n' >> {calls}; }}
 unset NO_COLOR; TERM=xterm-256color
 '''
 
-    def terminal(command, answer=b''):
+    def terminal(command, answer=b'', token_answer=b'\n'):
         pid, fd = pty.fork()
         if pid == 0:
             os.execvp('bash', ['bash', '-c', command])
         output = b''
         sent = False
+        token_sent = False
         finished = False
         deadline = time.monotonic() + 10
         try:
@@ -312,6 +313,11 @@ unset NO_COLOR; TERM=xterm-256color
                         finished = True
                         break
                     output += chunk
+                    assert b'CI_SECRET_CANARY' not in output
+                    if not token_sent and b'Ubuntu Pro token (Enter to skip):' in output:
+                        assert not lock.exists()  # Input precedes lock/installation.
+                        os.write(fd, token_answer)
+                        token_sent = True
                     if not sent and b'[1-5]:' in output:
                         # No preflight, lock or installation before selection.
                         assert calls.read_text() == '' and not lock.exists()
@@ -362,6 +368,7 @@ unset NO_COLOR; TERM=xterm-256color
     output = terminal(code + 'main </dev/null')
     assert calls.read_text() == 'start 1 0\nreport\n' and '[1-5]:' not in output
     calls.write_text('')
+    lock.unlink(missing_ok=True)
     terminal(code + f'main > {path / "redirected"}')
     assert calls.read_text() == 'start 1 0\nreport\n'
     assert '[1-5]:' not in (path / 'redirected').read_text()
@@ -500,3 +507,68 @@ pro() {
             assert 'report' not in calls and 'ssh' not in calls
             assert apt[-1].split().count(fail_apt) == 1
         print(f'PASS: APT/Pro MOCK {name}; order, upgrade/removal gates and errors')
+
+# Real hidden TTY input feeding the real Pro function, with host/APT mocks above.
+with tempfile.TemporaryDirectory() as directory:
+    path = pathlib.Path(directory)
+    calls = path / 'calls'
+    lock = path / 'lock'
+    isolated = main.replace('/run/lock/vps-bootstrap-proms.lock', str(lock))
+    isolated = isolated.replace('/run/vps-bootstrap-proms.XXXXXX', directory + '/state.XXXXXX')
+    token_mocks = r'''
+# Every mocked stage checks a real child's environment, without printing secrets.
+record() {
+  python3 -c 'import os; assert "UBUNTU_PRO_TOKEN" not in os.environ'
+  printf '%s\n' "$*" >> "$APT_TEST_DIR/calls"
+}
+eval "$(declare -f pro | sed '1s/^pro /original_pro /')"
+pro() {
+  if [[ $1 == attach ]]; then
+    [[ "$*" == "attach --no-auto-enable --attach-config $STATE_DIR/pro-attach.yaml" ]] || exit 99
+    python3 - "$STATE_DIR/pro-attach.yaml" <<'CHECK'
+import json, pathlib, sys
+p = pathlib.Path(sys.argv[1])
+assert json.loads(p.read_text()) == {"token": "CI_SECRET_CANARY"}
+assert p.stat().st_mode & 0o077 == 0
+CHECK
+    record attach
+    PRO_MODE=existing
+  else
+    original_pro "$@"
+  fi
+}
+final_report() {
+  [[ -z ${UBUNTU_PRO_TOKEN+x} && ! -e "$STATE_DIR/pro-attach.yaml" ]] || exit 99
+  record report
+}
+'''
+    for name, args, answer, inherited, mode, prompts, attaches in (
+        ('typed', '--reboot', b'CI_SECRET_CANARY\n', '', 'unattached', 1, 1),
+        ('empty', '--reboot', b'\n', '', 'unattached', 1, 0),
+        ('eof', '--reboot', b'\x04', '', 'unattached', 1, 0),
+        ('partial-eof', '--reboot', b'partial\x04\x04', '', 'unattached', 1, 0),
+        ('environment', '--reboot', b'wrong\n', 'CI_SECRET_CANARY', 'unattached', 0, 1),
+        ('attached', '--reboot', b'CI_SECRET_CANARY\n', '', 'existing', 1, 0),
+        ('nopro', '--nopro', b'', 'CI_SECRET_CANARY', 'unattached', 0, 0),
+        ('nopro-reboot', '--nopro --reboot', b'', '', 'unattached', 0, 0),
+        ('help', '--help', b'', '', 'unattached', 0, 0),
+        ('short-help', '-h', b'', '', 'unattached', 0, 0),
+        ('noninteractive', '--reboot </dev/null', b'', '', 'unattached', 0, 0),
+    ):
+        calls.write_text('')
+        lock.unlink(missing_ok=True)
+        code = (prefix + isolated + mocks + token_mocks +
+                f'\nexport APT_TEST_DIR={shlex.quote(directory)}; '
+                f'PRO_MODE={mode}; main {args}')
+        # Set inherited token before sourcing, just as with a process environment.
+        code = f'export UBUNTU_PRO_TOKEN={shlex.quote(inherited)}; ' + code
+        output = terminal(code, token_answer=answer)
+        trace = calls.read_text().splitlines()
+        assert 'CI_SECRET_CANARY' not in output + calls.read_text()
+        assert output.count('Ubuntu Pro token (Enter to skip):') == prompts
+        assert trace.count('attach') == attaches
+        if attaches:
+            assert trace.index('timezone') < trace.index('attach')
+        if prompts:
+            assert trace[:3] == ['root', 'inputs', 'os']
+        print(f'PASS: early Pro token MOCK {name}')
