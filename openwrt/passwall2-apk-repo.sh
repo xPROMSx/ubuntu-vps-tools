@@ -168,7 +168,9 @@ select_targets() {
         if [ "$name" != "$MAIN" ] || [ "$version" != "$PW_AVAIL" ]; then
             block 'Signed APK identity/version differs from the reviewed candidate.'
         fi
-        apk_run extract --destination "$WORK/extracted" "$file" >> "$WORK/download.log" 2>&1 || block 'Cannot verify/extract signed PassWall2 package.'
+        # fetch already verified identity against the signed index. This flag
+        # only permits inspection of that archive, never signed-feed installation.
+        apk_run --allow-untrusted extract --destination "$WORK/extracted" "$file" >> "$WORK/download.log" 2>&1 || block 'Cannot extract index-verified PassWall2 package.'
         file="$WORK/extracted/usr/lib/lua/luci/passwall2/util_xray.lua"
     else
         file=/usr/lib/lua/luci/passwall2/util_xray.lua

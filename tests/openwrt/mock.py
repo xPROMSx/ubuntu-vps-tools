@@ -175,7 +175,7 @@ elif command == 'apk':
     elif op == 'adbdump':
         print('info:\n  name: luci-app-passwall2\n  version: ' + state.get('signed_version', '26.10.29-r1'))
     elif op == 'extract':
-        if state.get('feed_extract_failure'):
+        if state.get('feed_extract_failure') or (state.get('standalone_untrusted') and '--allow-untrusted' not in args):
             print('UNTRUSTED signature', file=sys.stderr)
             sys.exit(1)
         dest = Path(tail[tail.index('--destination') + 1]) / 'usr/lib/lua/luci/passwall2/util_xray.lua'

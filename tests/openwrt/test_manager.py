@@ -287,6 +287,14 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(all(c[1][-1] == MAIN and '--keys-dir' in c[1] and '--allow-untrusted' not in c[1] for c in fetches))
         self.assertTrue(any('--url' not in c[1] and '--output' in c[1] for c in fetches))
         self.assertFalse(any(c[0] == 'apk' and 'verify' in c[1] for c in self.calls))
+        extracts = [c for c in self.calls if c[0] == 'apk' and 'extract' in c[1]]
+        self.assertEqual(len(extracts), 1)
+        args = extracts[0][1]
+        self.assertIn('--allow-untrusted', args)
+        self.assertIn('--keys-dir', args)
+        self.assertEqual(Path(args[args.index('--destination') + 1]).name, 'extracted')
+        self.assertTrue(all('extract' in c[1] for c in self.calls
+                            if c[0] == 'apk' and '--allow-untrusted' in c[1]))
 
     def test_signed_url_with_existing_local_apk_uses_simulation_and_output_dir(self):
         archive = self.root / (MAIN + '-' + PW + '.apk')
