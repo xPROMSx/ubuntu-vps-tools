@@ -121,6 +121,10 @@ and do not change swappiness.
 
 ## Flags and reboot
 
+With no arguments and TTY stdin/stdout, a one-shot menu selects the existing
+Pro/reboot flags before system changes; exit/EOF performs no installation.
+Any argument bypasses it. Non-interactive no-argument runs still start directly.
+
 `--help`/`-h` show usage. `--ssh-port PORT` selects Fail2ban ports (default auto),
 not sshd listeners. `--no-upgrade` skips both package upgrades, not base
 installation, index refreshes or Pro; `--autoremove` opts into removal once after

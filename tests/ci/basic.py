@@ -1,10 +1,14 @@
 """Fast argument/validation tests: no bootstrap execution or system changes."""
+import errno
 import os
 import pathlib
+import pty
 import re
+import select
 import shlex
 import subprocess
 import tempfile
+import time
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "vps-bootstrap-ubuntu24.sh"
@@ -265,6 +269,103 @@ assert '`-h`' in readme or '`-h, --help`' in readme
 for variable in re.findall(r'^  ([A-Z_]+)=', help_text, re.M):
     assert f'`{variable}`' in readme
 print('PASS: README/help CLI and environment override coverage')
+
+# Real TTY selection and main dispatch; every installation step is a mock.
+with tempfile.TemporaryDirectory() as directory:
+    path = pathlib.Path(directory)
+    calls = path / 'calls'
+    lock = path / 'lock'
+    isolated = main.replace('/run/lock/vps-bootstrap-proms.lock', str(lock))
+    isolated = isolated.replace('/run/vps-bootstrap-proms.XXXXXX', directory + '/state.XXXXXX')
+    mocks = ''.join(f'{name}() {{ :; }}; ' for name in '''
+        validate_inputs check_os flock provision_proms_ssh_keys migrate_legacy_backups
+        check_root_authorized_keys configure_swap initial_full_upgrade apt_install_base_packages
+        configure_bootstrap_ipv4_fallback set_timezone configure_ubuntu_pro apt_update apt_cleanup
+        check_systemd_manager configure_ssh configure_resolved configure_sysctl
+        configure_unattended_upgrades configure_ufw configure_fail2ban
+    '''.split())
+    code = prefix + isolated + '\n' + mocks + f'''
+require_root() {{ printf 'start %s %s\n' "$CONFIGURE_PRO" "$RUN_REBOOT" >> {calls}; }}
+final_report() {{ printf 'report\n' >> {calls}; }}
+unset NO_COLOR; TERM=xterm-256color
+'''
+
+    def terminal(command, answer=b''):
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.execvp('bash', ['bash', '-c', command])
+        output = b''
+        sent = False
+        finished = False
+        deadline = time.monotonic() + 10
+        try:
+            while time.monotonic() < deadline:
+                if select.select([fd], [], [], 0.1)[0]:
+                    try:
+                        chunk = os.read(fd, 4096)
+                    except OSError as exc:
+                        if exc.errno == errno.EIO:
+                            finished = True
+                            break
+                        raise
+                    if not chunk:
+                        finished = True
+                        break
+                    output += chunk
+                    if not sent and b'[1-5]:' in output:
+                        # No preflight, lock or installation before selection.
+                        assert calls.read_text() == '' and not lock.exists()
+                        os.write(fd, answer)
+                        sent = True
+            else:
+                raise AssertionError(f'bootstrap menu test timed out: {output!r}')
+        finally:
+            os.close(fd)
+            if not finished:
+                os.kill(pid, 9)
+            _, status = os.waitpid(pid, 0)
+        assert os.waitstatus_to_exitcode(status) == 0, output.decode(errors='replace')
+        return output.decode()
+
+    for answer, flags, retries in (
+        (b'1\n', '1 0', 0), (b'2\n', '1 1', 0),
+        (b'3\n', '0 0', 0), (b'4\n', '0 1', 0),
+        (b'5\n', None, 0), (b'\x04', None, 0),
+        (b'wrong\n0\n6\n\n4\n', '0 1', 4),
+    ):
+        calls.write_text('')
+        lock.unlink(missing_ok=True)
+        output = terminal(code + 'main; printf "completed=%s\\n" "$BOOTSTRAP_COMPLETED"', answer)
+        assert calls.read_text() == (f'start {flags}\nreport\n' if flags else '')
+        assert lock.exists() == bool(flags)
+        assert f'completed={int(bool(flags))}' in output
+        assert output.count('UBUNTU VPS TOOLS') == 1
+        assert output.count('[1-5]:') == retries + 1
+        assert output.count('Неверный выбор') == retries
+        assert '\033[1;36m' in output and '\033[1;37m' in output and '\033[2m' in output
+    for args in ('--reboot', '--nopro', '--nopro --reboot', '--noswap', '--no-upgrade',
+                 '--autoremove', '--skip-dns', '--ssh-port 2222', '--help', '-h'):
+        calls.write_text('')
+        lock.unlink(missing_ok=True)
+        output = terminal(code + f'main {args}')
+        flags = f'{int("--nopro" not in args)} {int("--reboot" in args)}'
+        assert calls.read_text() == ('' if args in ('--help', '-h') else f'start {flags}\nreport\n')
+        assert 'UBUNTU VPS TOOLS' not in output and '[1-5]:' not in output
+        if args in ('--help', '-h'):
+            assert 'Usage:' in output and not lock.exists()
+    for invoke in ('main', 'main </dev/null'):
+        calls.write_text('')
+        output = run(code + invoke).stdout
+        assert calls.read_text() == 'start 1 0\nreport\n'
+        assert 'UBUNTU VPS TOOLS' not in output and '[1-5]:' not in output
+    calls.write_text('')
+    output = terminal(code + 'main </dev/null')
+    assert calls.read_text() == 'start 1 0\nreport\n' and '[1-5]:' not in output
+    calls.write_text('')
+    terminal(code + f'main > {path / "redirected"}')
+    assert calls.read_text() == 'start 1 0\nreport\n'
+    assert '[1-5]:' not in (path / 'redirected').read_text()
+print('PASS: bootstrap menu 1-5, flags, invalid input/EOF, single run, CLI/help bypass and non-TTY dispatch MOCKS')
 
 with tempfile.TemporaryDirectory() as directory:
     isolated = main.replace('/run/lock/vps-bootstrap-proms.lock', directory + '/lock')

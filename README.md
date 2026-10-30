@@ -14,6 +14,10 @@ with a warning. Creation errors are non-fatal; no swappiness changes are made.
 sudo bash vps-bootstrap-ubuntu24.sh [options]
 ```
 
+Without arguments in an interactive terminal, a startup menu offers the normal
+run, `--reboot`, `--nopro`, their combination, or exit without changes. Any CLI
+arguments bypass the menu; non-interactive runs without arguments start directly.
+
 - `--ssh-port PORT`: Select Fail2ban SSH ports (comma-separated; default auto), without changing sshd listeners.
 - `--no-upgrade`: Skip both package upgrades; keep base installation, APT index refreshes and Pro setup.
 - `--autoremove`: Remove unused packages once after base installation and upgrades; removal is opt-in.
