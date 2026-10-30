@@ -32,6 +32,14 @@ current behavior from the older baseline. Keep both guides consistent.
 
 ## Installation sequence and failure boundaries
 
+The Ubuntu contracts below apply to `vps-bootstrap-ubuntu24.sh`.
+`openwrt/passwall2-apk-repo.sh` is independent, for OpenWrt 25.12.x / APK 3 /
+BusyBox ash. Read `openwrt/README.md`; preserve signed feeds, read-only checks,
+separate APK/runtime Xray versions, confirmation, narrow package plans and
+configuration/service states. Do not integrate with Ubuntu or run real router
+installation from development/CI. Use ash syntax, ShellCheck and the isolated
+`tests/openwrt` suite, which does not prove real OpenWrt behavior.
+
 The script parses arguments, requires root, validates inputs and the exact OS
 version/codename, acquires the existing flock and creates its temporary state
 directory. Managed key provisioning, checks and backups precede swap and the
@@ -189,6 +197,9 @@ PR metadata validation uses trusted full base/head SHAs, complete commit history
 and at most 1000 new commits; commits reachable from base are not revalidated.
 Missing/shallow history fails safely and rejected values never enter failure
 messages. Push events explicitly skip historical metadata validation; synthetic
-policy tests still run. The existing Basic checks and both VM jobs feed
-`CI / Required`. Require their success for review; do not assume GitHub Settings
+policy tests still run. Basic checks, OpenWrt offline checks and applicable VM
+jobs feed `CI / Required`. Only OpenWrt-only PRs and related documentation may
+skip VMs through the scope rule; Ubuntu/shared test/scope-rule/workflow changes
+and main pushes require both VMs. Require applicable checks to pass for review;
+do not assume GitHub Settings
 currently list those contexts as protected required checks, or change settings.

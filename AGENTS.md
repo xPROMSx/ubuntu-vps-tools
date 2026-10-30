@@ -23,6 +23,15 @@ or relax mandatory VM assertions to make a test pass.
 
 ## Runtime contracts to preserve
 
+The Ubuntu contracts below apply to `vps-bootstrap-ubuntu24.sh`. The independent
+OpenWrt entry point is `openwrt/passwall2-apk-repo.sh` for OpenWrt 25.12.x / APK 3
+and BusyBox ash. Read `openwrt/README.md` before changing it. Never run a real
+router install/update from development or CI. Preserve signed feeds, read-only
+checks, actual Xray runtime handling, explicit confirmation, narrow package
+plans and saved configuration/service state; do not integrate with Ubuntu.
+Validate with ash syntax, ShellCheck and `tests/openwrt` offline regressions.
+These mocks do not prove real OpenWrt behavior.
+
 - Root `/root/.ssh/authorized_keys` is exclusively managed: validated keys from
   the configured SSH ID source, one mandatory personal Ed25519 identity and two
   mandatory FIDO identities. Unknown/provider keys are replaced, with recovery
@@ -166,5 +175,8 @@ The checker validates only trusted full base/head SHA PR ranges (maximum 1000
 new commits), fails on shallow/missing history and redacts rejected identity
 values. Push events intentionally skip historical identity validation. Basic
 checks invoke its synthetic regression suite. Existing `CI / Required` depends
-on Basic checks and both VM jobs; passing it is a contributor requirement, not
+on Basic checks, OpenWrt offline checks and both VM jobs when applicable. Only
+OpenWrt-only PRs and related documentation may skip VMs through the scope rule;
+Ubuntu/shared test/scope-rule/workflow changes and main pushes require VMs.
+Passing it is a contributor requirement, not
 a claim that repository protection currently enforces those status contexts.
