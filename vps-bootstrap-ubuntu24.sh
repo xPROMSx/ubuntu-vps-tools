@@ -17,6 +17,8 @@ TIMEZONE="${TIMEZONE:-Europe/Moscow}"
 SSH_PORT="${SSH_PORT:-auto}"
 IGNORE_IPS="${IGNORE_IPS:-127.0.0.1/8 ::1 84.22.133.232 95.182.112.211 185.230.190.12}"
 UBUNTU_PRO_TOKEN="${UBUNTU_PRO_TOKEN:-}"
+# Keep an inherited token shell-local before any child processes run.
+export -n UBUNTU_PRO_TOKEN
 AUTO_REBOOT_TIME="${AUTO_REBOOT_TIME:-04:38}"
 RUN_UPGRADE=1
 RUN_AUTOREMOVE=0
@@ -837,6 +839,15 @@ PY
   fi
 }
 
+read_ubuntu_pro_token() {
+  if [[ "$CONFIGURE_PRO" -eq 0 ]]; then
+    unset UBUNTU_PRO_TOKEN
+  elif [[ -z "${UBUNTU_PRO_TOKEN:-}" && -t 0 ]]; then
+    read -rsp "Ubuntu Pro token (Enter to skip): " UBUNTU_PRO_TOKEN || UBUNTU_PRO_TOKEN=""
+    echo
+  fi
+}
+
 configure_ubuntu_pro() {
   ESM_REPOS_ENABLED=0
   if [[ "$CONFIGURE_PRO" -eq 0 ]]; then
@@ -854,10 +865,6 @@ configure_ubuntu_pro() {
     return 0
   fi
   if [[ "$attached" != true ]]; then
-    if [[ -z "$token" && -t 0 ]]; then
-      read -rsp "Ubuntu Pro token (Enter to skip): " token || token=""
-      echo
-    fi
     if [[ -z "$token" ]]; then
       warn "No Ubuntu Pro token provided; Pro services skipped"
       summary_set pro warn "not attached (optional)"
@@ -2155,6 +2162,7 @@ main() {
   require_root
   validate_inputs
   check_os
+  read_ubuntu_pro_token
   exec 9>/run/lock/vps-bootstrap-proms.lock
   flock -n 9 || die "Another bootstrap instance is running"
   STATE_DIR="$(mktemp -d /run/vps-bootstrap-proms.XXXXXX)"

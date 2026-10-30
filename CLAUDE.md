@@ -118,6 +118,12 @@ optional warning; unavailable services and actual failures remain distinct.
 does not remove ubuntu-pro-client, change repositories or stop read-only final
 status reporting. Never trace tokens or expose token attachment files.
 
+Ubuntu Pro token input occurs once after root/input/OS validation, before bootstrap
+work. Keep inherited tokens shell-local from startup; never export them to early
+APT children. Empty/EOF input skips attachment without a later prompt. Pro status,
+attachment and service activation stay after the initial upgrade/base packages;
+already attached systems never reattach even with a pre-collected token.
+
 Any active swap, regardless of type/size/location, is preserved untouched. Only
 ext4/XFS with at least 4 GiB free can receive a new 1 GiB root:root 0600
 `/swapfile`. Existing inactive files, symlinks or fstab entries need manual review.
