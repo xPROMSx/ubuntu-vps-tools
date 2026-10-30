@@ -387,6 +387,32 @@ processes() {
         printf '%s\n' "${entry%/cmdline}"
     done
 }
+main_proxy_enabled() {
+    local node
+    [ -s /etc/config/passwall2 ] || return 1
+    [ "$(uci -q get 'passwall2.@global[0].enabled' 2>/dev/null || true)" = 1 ] || return 1
+    node=$(uci -q get 'passwall2.@global[0].node' 2>/dev/null || true)
+    [ -n "$node" ] || return 1
+    [ "$(uci -q get "passwall2.$node" 2>/dev/null || true)" = nodes ] || return 1
+    [ -n "$(uci -q get "passwall2.$node.type" 2>/dev/null || true)" ]
+}
+wait_main_processes() {
+    local elapsed=0
+    # Upstream start may legitimately finish without residents when all modes are off.
+    if ! main_proxy_enabled &&
+        [ "$(uci -q get 'passwall2.@global[0].socks_enabled' 2>/dev/null || true)" != 1 ] &&
+        [ "$(uci -q get 'passwall2.@global[0].acl_enable' 2>/dev/null || true)" != 1 ] &&
+        [ "$(uci -q get 'passwall2.@global_haproxy[0].balancing_enable' 2>/dev/null || true)" != 1 ]; then
+        info 'No enabled PassWall2 proxy mode; no resident processes are expected.'
+        return 0
+    fi
+    while [ -z "$(processes passwall2)" ]; do
+        [ "$elapsed" -lt 15 ] || return 1
+        sleep 1
+        elapsed=$((elapsed + 1))
+    done
+    return 0
+}
 prefetch() {
     local action pkg version arg
     set --
@@ -432,6 +458,13 @@ backup() {
             [ ! -x /etc/init.d/dnsmasq ] || ! /etc/init.d/dnsmasq running >/dev/null 2>&1 || running=1
         else
             [ -z "$(processes "$svc")" ] || running=1
+        fi
+        # ASU can retain an active UCI setup while removing the package/init script.
+        # Existing init scripts always retain their observed enable/running states.
+        if [ "$svc" = passwall2 ] && [ -z "$PW_INST" ] &&
+            [ ! -x /etc/init.d/passwall2 ] && main_proxy_enabled; then
+            enabled=1
+            running=1
         fi
         printf '%s|%s|%s\n' "$svc" "$enabled" "$running" >> "$WORK/services"
     done
@@ -554,6 +587,8 @@ apply() {
             timeout 180 "/etc/init.d/$svc" restart > "$BACKUP/start-$svc.log" 2>&1 || fail "Startup of $svc not confirmed; inspect the new start log."
             if [ "$svc" = dnsmasq ]; then
                 /etc/init.d/dnsmasq running >/dev/null 2>&1 || fail 'dnsmasq is not running.'
+            elif [ "$svc" = passwall2 ]; then
+                wait_main_processes || fail 'passwall2 has no runtime processes after startup (15 second timeout).'
             else
                 [ -n "$(processes "$svc")" ] || fail "$svc has no runtime processes after startup."
             fi

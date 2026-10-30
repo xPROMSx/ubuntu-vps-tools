@@ -116,6 +116,10 @@ Changes require confirmation. A suitable Xray binary is preserved even when
 its APK metadata is older. No languages or additional cores are selected.
 Service enable/running states are preserved; a fresh install leaves services
 stopped and disabled for the owner to configure and start.
+After ASU, an absent package/init script with a saved, explicitly enabled main
+proxy and an existing selected node restores main-service autostart and operation.
+Disabled or incomplete saved settings do not trigger this recovery; the server
+is never started automatically from saved configuration alone.
 
 Limitations: repository/key availability, explicit upstream Xray requirements,
 custom binary paths and unusual dependency plans can require manual review.

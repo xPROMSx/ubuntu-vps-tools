@@ -38,8 +38,10 @@ def service(name, action):
             return 1
         svc['running'] = action != 'stop'
         proc.mkdir(parents=True, exist_ok=True)
+        pending = name == 'passwall2' and svc['running'] and (state.get('process_delay', 0) or state.get('no_processes'))
+        state['process_pending'] = bool(pending)
         (proc / 'cmdline').write_bytes(
-            f'{root}/tmp/etc/{name}/fixture\0'.encode() if svc['running'] else b'')
+            f'{root}/tmp/etc/{name}/fixture\0'.encode() if svc['running'] and not pending else b'')
     save()
     return 0
 
@@ -51,6 +53,13 @@ if command == 'id':
 elif command == 'df':
     print('Filesystem 1024-blocks Used Available Capacity Mounted on')
     print('fixture 9999999 0 9999999 0% /')
+elif command == 'sleep':
+    assert args == ['1'], 'Only one-second startup polling is expected'
+    state['sleep_calls'] = state.get('sleep_calls', 0) + 1
+    if state.get('process_pending') and not state.get('no_processes') and state['sleep_calls'] >= state['process_delay']:
+        (root / 'proc/101/cmdline').write_bytes(f'{root}/tmp/etc/passwall2/fixture\0'.encode())
+        state['process_pending'] = False
+    save()
 elif command == 'uci':
     if 'set' in args:
         key, value = args[-1].split('=', 1)
@@ -156,6 +165,10 @@ elif command == 'apk':
                     runtime(ver.split('-r')[0])
                 if pkg == 'luci-app-passwall2':
                     (root / 'usr/share/passwall2/0_default_config').write_text('vendor default fixture\n')
+                    for svc in ('passwall2', 'passwall2_server'):
+                        init = root / 'etc/init.d' / svc
+                        if not init.exists():
+                            init.symlink_to(Path(__file__).resolve())
         # Model unwanted postinst effects: manager must restore original settings.
         (root / 'etc/config/passwall2').write_text('postinst changed configuration\n')
         (root / 'etc/config/dhcp').write_text('postinst changed DHCP\n')

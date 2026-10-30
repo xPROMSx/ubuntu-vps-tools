@@ -91,8 +91,23 @@ application code is not restored over the update. Prior enable and running
 states are restored individually. The server is never started or enabled
 merely because this is `install`.
 
+When ASU removed the PassWall2 package and init script, saved UCI settings can
+recover the main service: `global.enabled=1`, a selected existing `nodes` section
+and its nonempty `type` are required. These follow upstream `app.sh`/`utils.sh`
+startup selection. The main service is then enabled and started after restoring
+the saved files. A fresh installation or disabled/incomplete settings stay off.
+An existing init script always retains its observed enable/running state,
+including an intentionally stopped service. Server state is never inferred from
+saved configuration.
+
 Postchecks verify package/runtime versions, startup exit status and process
-presence. They do not scan historical logs or prove LAN DNS, firewall behavior
+presence. Main-service processes are checked immediately, then once a second
+for up to 15 seconds, stopping at the first match under `/tmp/etc/passwall2/`.
+An unrelated Xray process does not qualify. When main proxy, SOCKS, ACL and
+HAProxy modes are all off, upstream can finish without resident processes;
+this configuration does not require a process match. dnsmasq retains its own
+service-state check. No extra restart or recovery attempt is made on timeout.
+These checks do not scan historical logs or prove LAN DNS, firewall behavior
 or remote node reachability. The owner must check real OpenWrt behavior,
 especially dnsmasq replacement and postinst effects after ASU.
 

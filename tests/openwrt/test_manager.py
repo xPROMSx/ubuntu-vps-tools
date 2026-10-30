@@ -33,10 +33,12 @@ class ManagerTests(unittest.TestCase):
             (self.root / directory).mkdir(parents=True, exist_ok=True)
         self.state = dict(installed={MAIN: PW, 'xray-core': '26.9.9-r1', **dict.fromkeys(COMPONENTS, '1.0-r1')},
                           available={MAIN: PW, 'xray-core': XR},
+                          uci={'passwall2.@global[0].enabled': '1', 'passwall2.@global[0].node': 'saved-node',
+                               'passwall2.saved-node': 'nodes', 'passwall2.saved-node.type': 'Xray'},
                           closure=[MAIN, 'xray-core', *COMPONENTS, 'libexample'], plan='OK: 1 MiB in 12 packages\n', actions=[],
                           services={s: dict(enabled=s == 'passwall2', running=s == 'passwall2') for s in ['passwall2', 'passwall2_server', 'dnsmasq']})
         self.put('etc/openwrt_release', "DISTRIB_RELEASE='25.12.1'\nDISTRIB_ARCH='x86_64'\n")
-        self.put('etc/config/passwall2', "config global\n option enabled '1'\n option node 'saved-node'\n")
+        self.put('etc/config/passwall2', "config global\n option enabled '1'\n option node 'saved-node'\nconfig nodes 'saved-node'\n option type 'Xray'\n")
         self.put('etc/config/dhcp', 'saved DHCP configuration\n')
         self.put('etc/config/firewall', 'foreign firewall settings\n')
         self.put('etc/apk/world', MAIN + '=26.9.12-r1\nforeign~1.0\n')
@@ -48,7 +50,7 @@ class ManagerTests(unittest.TestCase):
         self.put('usr/bin/xray', '#!/bin/sh\necho "Xray 26.10.25 fixture"\n', True)
         self.put('usr/lib/lua/luci/passwall2/util_xray.lua', 'local xray_min_version = "26.7.11"\n')
         mock = REPO / 'tests/openwrt/mock.py'
-        for name in ['id', 'df', 'uci', 'apk', 'jsonfilter', 'wget']:
+        for name in ['id', 'df', 'uci', 'apk', 'jsonfilter', 'wget', 'sleep']:
             (self.root / 'bin' / name).symlink_to(mock)
         for svc in self.state['services']:
             (self.root / 'etc/init.d' / svc).symlink_to(mock)
@@ -66,7 +68,7 @@ class ManagerTests(unittest.TestCase):
         # Some BusyBox builds prefer their own applets over PATH executables.
         # Shell functions keep command doubles authoritative in both ash builds.
         doubles = '\n'.join(f'{name}() {{ "$PW_TEST_ROOT/bin/{name}" "$@"; }}'
-                            for name in ['id', 'df', 'uci', 'apk', 'jsonfilter', 'wget'])
+                            for name in ['id', 'df', 'uci', 'apk', 'jsonfilter', 'wget', 'sleep'])
         translated = ''.join(lines).replace('set -eu\n', 'set -eu\n' + doubles + '\n', 1)
         self.script.write_text(translated.replace(
             '52802b143489214e13b78f96599a147a638205cc22d9dd6d71229504e38ddc00',
@@ -84,6 +86,14 @@ class ManagerTests(unittest.TestCase):
     def plan(self, actions):
         self.state['actions'] = actions
         self.state['plan'] = ''.join(f'({i}/{len(actions)}) {a} {p} ({v})\n' for i, (a, p, v) in enumerate(actions, 1)) + 'OK: 10 MiB in 20 packages\n'
+
+    def asu_install(self):
+        self.state['installed'].pop(MAIN, None)
+        for svc in ('passwall2', 'passwall2_server'):
+            (self.root / 'etc/init.d' / svc).unlink(missing_ok=True)
+            self.state['services'][svc] = dict(enabled=False, running=False)
+        (self.root / 'proc/101/cmdline').write_bytes(b'')
+        self.plan([('Installing', MAIN, PW)])
 
     def run_manager(self, *args, answer='yes\n', snippet=None):
         (self.root / 'state.json').write_text(json.dumps(self.state))
@@ -148,6 +158,7 @@ class ManagerTests(unittest.TestCase):
         self.assertIn(MAIN + '=' + PW, commits[0][1])
         self.assertFalse(any(a.startswith('xray-core') for a in commits[0][1]))
         self.assertEqual((self.root / 'etc/apk/world').read_text(), 'foreign~1.0\n' + MAIN + '\n')
+        self.assertEqual(self.state.get('sleep_calls', 0), 0)
 
     def test_missing_xray_installed(self):
         del self.state['installed']['xray-core']
@@ -288,13 +299,16 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('dnsmasq-full\n', world)
 
     def test_previously_disabled_stopped_main_is_preserved(self):
-        self.state['services']['passwall2'] = dict(enabled=False, running=False)
-        (self.root / 'proc/101/cmdline').write_bytes(b'')
-        self.state['installed'][MAIN] = '26.9.12-r1'
-        self.plan([('Upgrading', MAIN, PW)])
-        result = self.run_manager('update')
-        self.assertEqual(result.returncode, 0, self.output)
-        self.assertEqual(self.state['services']['passwall2'], dict(enabled=False, running=False))
+        for enabled, running in [(False, False), (True, False), (False, True)]:
+            with self.subTest(enabled=enabled, running=running):
+                expected = dict(enabled=enabled, running=running)
+                self.state['services']['passwall2'] = expected.copy()
+                (self.root / 'proc/101/cmdline').write_bytes(f'{self.root}/tmp/etc/passwall2/fixture\0'.encode() if running else b'')
+                self.state['installed'][MAIN] = '26.9.12-r1'
+                self.plan([('Upgrading', MAIN, PW)])
+                result = self.run_manager('update')
+                self.assertEqual(result.returncode, 0, self.output)
+                self.assertEqual(self.state['services']['passwall2'], expected)
 
     def test_startup_failure_remains_failure(self):
         self.state['installed'][MAIN] = '26.9.12-r1'
@@ -353,6 +367,8 @@ class ManagerTests(unittest.TestCase):
         (self.root / 'proc/101/cmdline').write_bytes(b'')
         (self.root / 'usr/bin/xray').unlink()
         (self.root / 'etc/config/passwall2').unlink()
+        for svc in ('passwall2', 'passwall2_server'):
+            (self.root / 'etc/init.d' / svc).unlink()
         self.plan([('Installing', MAIN, PW), ('Installing', 'xray-core', XR),
                    *(('Installing', p, '1.0-r1') for p in COMPONENTS)])
         result = self.run_manager('install')
@@ -363,6 +379,64 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.state['uci']['firewall.passwall2'], 'include')
         for service in self.state['services'].values():
             self.assertEqual(service, dict(enabled=False, running=False))
+
+    def test_asu_restores_saved_active_proxy_without_starting_server(self):
+        self.asu_install()
+        original = (self.root / 'etc/config/passwall2').read_bytes()
+        result = self.run_manager('install')
+        self.assertEqual(result.returncode, 0, self.output)
+        self.assertEqual((self.root / 'etc/config/passwall2').read_bytes(), original)
+        self.assertEqual(self.state['services']['passwall2'], dict(enabled=True, running=True))
+        self.assertEqual(self.state['services']['passwall2_server'], dict(enabled=False, running=False))
+        self.assertFalse(any(c[0] == 'passwall2_server' and c[1][0] in ('start', 'restart') for c in self.calls))
+
+    def test_asu_disabled_or_incomplete_config_does_not_start_proxy(self):
+        for override in [
+            {'passwall2.@global[0].enabled': '0'},
+            {'passwall2.@global[0].node': ''},
+            {'passwall2.saved-node': 'other-section-type'},
+            {'passwall2.saved-node.type': ''},
+        ]:
+            with self.subTest(override=override):
+                self.asu_install()
+                self.state['uci'] = {'passwall2.@global[0].enabled': '1', 'passwall2.@global[0].node': 'saved-node',
+                                     'passwall2.saved-node': 'nodes', 'passwall2.saved-node.type': 'Xray', **override}
+                result = self.run_manager('install')
+                self.assertEqual(result.returncode, 0, self.output)
+                for svc in ('passwall2', 'passwall2_server'):
+                    self.assertEqual(self.state['services'][svc], dict(enabled=False, running=False))
+
+    def test_delayed_passwall_processes_finish_before_timeout(self):
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        self.state['process_delay'] = 2
+        self.plan([('Upgrading', MAIN, PW)])
+        result = self.run_manager('update')
+        self.assertEqual(result.returncode, 0, self.output)
+        self.assertEqual(self.state['sleep_calls'], 2)
+
+    def test_missing_passwall_processes_fail_even_with_unrelated_xray(self):
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        self.state['no_processes'] = True
+        self.put('proc/201/cmdline', f'{self.root}/usr/bin/xray\0run\0-config\0unrelated.json\0')
+        self.plan([('Upgrading', MAIN, PW)])
+        result = self.run_manager('update')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.state['sleep_calls'], 15)
+        self.assertEqual(self.state['commits'], 1)
+        self.assertEqual(sum(c[0] == 'passwall2' and c[1][0] == 'restart' for c in self.calls), 1)
+        self.assertIn('15 second timeout', self.output)
+        self.assertNotIn('Completed.', self.output)
+        self.assertTrue((self.root / 'root/passwall2-apk-backup/start-passwall2.log').exists())
+
+    def test_all_proxy_modes_disabled_allow_processless_restart(self):
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        self.state['uci']['passwall2.@global[0].enabled'] = '0'
+        self.state['no_processes'] = True
+        self.plan([('Upgrading', MAIN, PW)])
+        result = self.run_manager('update')
+        self.assertEqual(result.returncode, 0, self.output)
+        self.assertIn('no resident processes are expected', self.output)
+        self.assertEqual(self.state.get('sleep_calls', 0), 0)
 
 
 if __name__ == '__main__':
