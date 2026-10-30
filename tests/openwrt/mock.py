@@ -159,14 +159,25 @@ elif command == 'apk':
         if '=' in tail[-1]:
             print('ERROR: unable to select package', file=sys.stderr)
             sys.exit(1)
-        assert '--url' in tail and tail[-1] == 'luci-app-passwall2', tail
-        # APK 3.0.5 can skip URL output when a local archive already exists.
-        if '--simulate' not in tail and (Path.cwd() / 'luci-app-passwall2-26.10.29-r1.apk').exists():
-            sys.exit(0)
-        print(state.get('signed_url', 'https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-25.12/x86_64/passwall2/luci-app-passwall2-26.10.29-r1.apk'))
+        assert tail[-1] == 'luci-app-passwall2', tail
+        if '--url' in tail:
+            # APK 3.0.5 can skip URL output when a local archive already exists.
+            if '--simulate' not in tail and (Path.cwd() / 'luci-app-passwall2-26.10.29-r1.apk').exists():
+                sys.exit(0)
+            print(state.get('signed_url', 'https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-25.12/x86_64/passwall2/luci-app-passwall2-26.10.29-r1.apk'))
+        else:
+            assert '--output' in tail and '--simulate' not in tail, tail
+            if state.get('bad_feed_signature') or state.get('corrupt_feed_package') or state.get('feed_download_failure'):
+                print('ERROR: package identity verification/download failed', file=sys.stderr)
+                sys.exit(1)
+            dest = Path(tail[tail.index('--output') + 1])
+            (dest / 'luci-app-passwall2-26.10.29-r1.apk').write_text('index-verified APK fixture')
     elif op == 'adbdump':
         print('info:\n  name: luci-app-passwall2\n  version: ' + state.get('signed_version', '26.10.29-r1'))
     elif op == 'extract':
+        if state.get('feed_extract_failure'):
+            print('UNTRUSTED signature', file=sys.stderr)
+            sys.exit(1)
         dest = Path(tail[tail.index('--destination') + 1]) / 'usr/lib/lua/luci/passwall2/util_xray.lua'
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(f'local xray_min_version = "{state.get("minimum", "26.7.11")}"\n')
@@ -189,7 +200,7 @@ elif command == 'apk':
         state['cached'] = True
         save()
     elif op == 'verify':
-        sys.exit(1 if state.get('bad_dependency_signature') or state.get('bad_feed_signature') else 0)
+        sys.exit(1 if state.get('bad_dependency_signature') or state.get('bad_feed_signature') or state.get('standalone_untrusted') else 0)
     elif op in ('add', 'fix'):
         if '--simulate' in tail:
             if state.get('offline_needs_cache') and '--no-network' in args and not state.get('cached'):

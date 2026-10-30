@@ -279,12 +279,14 @@ class ManagerTests(unittest.TestCase):
 
     def test_signed_fetch_uses_name_url_despite_exact_fetch_failure(self):
         self.asu_install()
+        self.state['standalone_untrusted'] = True
         result = self.run_manager('install')
         self.assertEqual(result.returncode, 0, self.output)
         fetches = [c for c in self.calls if c[0] == 'apk' and 'fetch' in c[1]]
         self.assertTrue(fetches)
-        self.assertTrue(all('--url' in c[1] and c[1][-1] == MAIN for c in fetches))
-        self.assertTrue(any(c[0] == 'apk' and 'verify' in c[1] for c in self.calls))
+        self.assertTrue(all(c[1][-1] == MAIN and '--keys-dir' in c[1] and '--allow-untrusted' not in c[1] for c in fetches))
+        self.assertTrue(any('--url' not in c[1] and '--output' in c[1] for c in fetches))
+        self.assertFalse(any(c[0] == 'apk' and 'verify' in c[1] for c in self.calls))
 
     def test_signed_url_with_existing_local_apk_uses_simulation_and_output_dir(self):
         archive = self.root / (MAIN + '-' + PW + '.apk')
@@ -298,8 +300,10 @@ class ManagerTests(unittest.TestCase):
         fetches = [c for c in self.calls if c[0] == 'apk' and 'fetch' in c[1]]
         self.assertTrue(fetches)
         for _, args, _ in fetches:
-            self.assertIn('--simulate', args)
-            self.assertIn('--url', args)
+            if '--url' in args:
+                self.assertIn('--simulate', args)
+            else:
+                self.assertNotIn('--simulate', args)
             directory = Path(args[args.index('--output') + 1])
             self.assertNotEqual(directory, self.root)
             self.assertEqual(directory.name, 'package')
@@ -320,7 +324,9 @@ class ManagerTests(unittest.TestCase):
 
     def test_signed_fetch_rejects_wrong_source_version_and_signature(self):
         for setting in ({'signed_url': 'https://example.org/luci-app-passwall2-26.10.29-r1.apk'},
-                        {'signed_version': '26.9.12-r1'}, {'bad_feed_signature': True}):
+                        {'signed_version': '26.9.12-r1'}, {'bad_feed_signature': True},
+                        {'corrupt_feed_package': True}, {'feed_download_failure': True},
+                        {'feed_extract_failure': True}):
             with self.subTest(setting=setting):
                 self.state.update(setting)
                 self.asu_install()

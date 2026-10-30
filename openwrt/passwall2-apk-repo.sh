@@ -161,8 +161,7 @@ select_targets() {
             *) block 'Selected APK URL differs from the reviewed signed-feed version/source.';;
         esac
         file="$WORK/package/$MAIN-$PW_AVAIL.apk"
-        fetch "$file" "$url" || fail 'Cannot download signed PassWall2 package for compatibility inspection.'
-        apk_run verify "$file" >/dev/null 2>&1 || block 'Signed PassWall2 package verification failed.'
+        network apk_run fetch --output "$WORK/package" "$MAIN" >/dev/null 2>&1 || fail 'Cannot fetch PassWall2 package verified against the signed index.'
         apk_run adbdump "$file" > "$WORK/package-metadata" 2>/dev/null || block 'Cannot inspect signed APK metadata.'
         name=$(awk '/^info:$/ {info=1; next} info && /^  name: / {print $2; exit}' "$WORK/package-metadata")
         version=$(awk '/^info:$/ {info=1; next} info && /^  version: / {print $2; exit}' "$WORK/package-metadata")
