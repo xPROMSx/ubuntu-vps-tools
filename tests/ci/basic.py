@@ -572,3 +572,183 @@ final_report() {
         if prompts:
             assert trace[:3] == ['root', 'inputs', 'os']
         print(f'PASS: early Pro token MOCK {name}')
+
+# Exercise the real APT transaction and unit helpers with disposable paths and
+# a stateful systemctl double. No host units, APT configuration or packages change.
+update_helpers = '\n'.join(
+    re.search(r'^' + name + r'\(\) \{\n.*?(?=^[a-z_]+\(\) \{|\Z)', SOURCE, re.M | re.S).group()
+    for name in ('configure_unattended_upgrades', 'configure_apt_timers', 'verify_apt_timer'))
+update_mocks = r'''
+declare -A enabled=() active=()
+units=(apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service)
+for unit in "${units[@]}"; do
+  enabled[$unit]=$INITIAL_ENABLED
+  active[$unit]=$INITIAL_ACTIVE
+done
+# APT workers normally have static enablement and must never be stopped.
+if [[ $INITIAL_ENABLED == enabled* ]]; then
+  enabled[apt-daily.service]=static
+  enabled[apt-daily-upgrade.service]=static
+fi
+ensure_apt_units() { :; }
+backup_file() { :; }
+python3() {
+  if [[ ${2:-} == 04:38 ]]; then
+    cat >/dev/null
+    [[ $FAULT != config ]]
+  else
+    command python3 "$@"
+  fi
+}
+systemctl() {
+  printf '%s\n' "$*" >> "$UPDATE_TEST_DIR/calls"
+  local action=$1 unit=${@: -1} runtime=0 quiet=0
+  shift
+  case " $* " in *' --runtime '*) runtime=1 ;; esac
+  case " $* " in *' --quiet '*) quiet=1 ;; esac
+  case "$action" in
+    daemon-reload) return 0 ;;
+    is-enabled)
+      (( quiet )) || printf '%s\n' "${enabled[$unit]}"
+      [[ ${enabled[$unit]} == enabled* || ${enabled[$unit]} == static ]]
+      return ;;
+    is-active)
+      (( quiet )) || printf '%s\n' "${active[$unit]}"
+      [[ ${active[$unit]} == active ]]
+      return ;;
+    show)
+      unit=$1
+      case "$3" in
+        LoadState) printf 'loaded\n' ;;
+        RandomizedDelayUSec) printf '0\n' ;;
+        Persistent) printf 'yes\n' ;;
+        AccuracyUSec) printf '1s\n' ;;
+        TimersCalendar)
+          local clock=02:30
+          [[ $unit != apt-daily-upgrade.timer ]] || clock=02:50
+          printf '{ OnCalendar=*-*-* %s:00 Europe/Moscow ; next_elapse=unused }\n' "$clock" ;;
+        TimersMonotonic) : ;;
+        NextElapseUSecRealtime)
+          local clock=02:30
+          [[ $unit != apt-daily-upgrade.timer ]] || clock=02:50
+          printf '2030-01-01 %s:00 +0300\n' "$clock" ;;
+        *) return 99 ;;
+      esac
+      return 0 ;;
+  esac
+  for unit in "$@"; do
+    [[ $unit != --* ]] || continue
+    case "$action" in
+      unmask)
+        if [[ ${enabled[$unit]} == masked && $runtime == 0 ||
+              ${enabled[$unit]} == masked-runtime && $runtime == 1 ]]; then
+          enabled[$unit]=disabled
+        fi ;;
+      enable)
+        [[ ${enabled[$unit]} != masked* ]] || return 1
+        if [[ $unit == unattended-upgrades.service && " $* " == *' --now '* ]]; then
+          [[ $FAULT != unmask-failure ]] || return 1
+          if [[ $FAULT == concurrent ]]; then active[apt-daily.service]=active; fi
+        fi
+        enabled[$unit]=enabled
+        (( ! runtime )) || enabled[$unit]=enabled-runtime
+        if [[ " $* " == *' --now '* ]]; then active[$unit]=active; fi
+        if [[ $unit == unattended-upgrades.service && " $* " == *' --now '* ]]; then
+          [[ $FAULT != enable && $FAULT != restore && $FAULT != silent-restore && $FAULT != concurrent ]] || return 1
+          [[ $FAULT != inactive ]] || active[$unit]=inactive
+          [[ $FAULT != disabled ]] || enabled[$unit]=disabled
+        fi ;;
+      disable) enabled[$unit]=disabled ;;
+      mask)
+        if [[ $unit == unattended-upgrades.service && $FAULT == restore ]]; then return 1; fi
+        if [[ $unit == unattended-upgrades.service && $FAULT == silent-restore ]]; then continue; fi
+        enabled[$unit]=masked
+        (( ! runtime )) || enabled[$unit]=masked-runtime ;;
+      restart|start) active[$unit]=active ;;
+      stop)
+        [[ $unit != apt-daily.service && $unit != apt-daily-upgrade.service ]] || return 99
+        active[$unit]=inactive ;;
+      *) return 99 ;;
+    esac
+  done
+  return 0
+}
+'''
+with tempfile.TemporaryDirectory() as directory:
+    for name, initial_enabled, initial_active, fault, recovered in (
+        ('masked-success', 'masked', 'inactive', '', True),
+        ('noble-masked-success', 'masked', 'inactive', '', True),
+        ('runtime-success', 'masked-runtime', 'inactive', '', True),
+        ('masked-enable-failure', 'masked', 'inactive', 'enable', True),
+        ('runtime-enable-failure', 'masked-runtime', 'inactive', 'enable', True),
+        ('failure-after-unmask', 'masked', 'inactive', 'unmask-failure', True),
+        ('inactive-after-enable', 'masked', 'inactive', 'inactive', True),
+        ('disabled-after-enable', 'masked', 'inactive', 'disabled', True),
+        ('enabled-active', 'enabled', 'active', '', True),
+        ('enabled-active-failure', 'enabled', 'active', 'enable', True),
+        ('runtime-enabled-failure', 'enabled-runtime', 'active', 'enable', True),
+        ('config-failure', 'masked', 'inactive', 'config', True),
+        ('restore-command-failure', 'masked', 'inactive', 'restore', False),
+        ('restore-state-mismatch', 'masked', 'inactive', 'silent-restore', False),
+        ('concurrent-apt-preserved', 'masked', 'inactive', 'concurrent', False),
+    ):
+        path = pathlib.Path(directory) / name
+        for sub in ('etc/apt/apt.conf.d', 'etc/systemd/system', 'state'):
+            (path / sub).mkdir(parents=True, exist_ok=True)
+        original = path / 'etc/apt/apt.conf.d/20auto-upgrades'
+        original.write_text('# original fixture\n')
+        isolated = update_helpers.replace('/etc/', str(path / 'etc') + '/')
+        result = run(prefix + isolated + update_mocks + r'''
+STATE_DIR=$UPDATE_TEST_DIR/state
+VERSION_CODENAME=$UPDATE_CODENAME
+verify_update_result() {
+  if [[ -z $FAULT ]]; then
+    [[ ${#FAILED_CHECKS[@]} == 0 && ${SUMMARY_STATE[updates]} == ok && -z $TX_SERVICE ]]
+    for unit in apt-daily.timer apt-daily-upgrade.timer unattended-upgrades.service; do
+      [[ ${enabled[$unit]} == enabled && ${active[$unit]} == active ]]
+    done
+    configure_unattended_upgrades
+    [[ ${#FAILED_CHECKS[@]} == 0 && -z $TX_SERVICE ]]
+  else
+    [[ ${#FAILED_CHECKS[@]} -gt 0 && ${SUMMARY_STATE[updates]} == fail ]]
+    [[ $(cat "$UPDATE_TEST_DIR/etc/apt/apt.conf.d/20auto-upgrades") == '# original fixture' ]]
+    if [[ $RECOVERED == True ]]; then
+      [[ -z $TX_SERVICE && $TX_RECOVERY_INCOMPLETE == 0 ]]
+      for unit in "${units[@]}"; do
+        [[ ${enabled[$unit]} == "${APT_UNIT_ENABLED[$unit]}" ]]
+        [[ ${active[$unit]} == "${APT_UNIT_ACTIVE[$unit]}" ]]
+      done
+    else
+      [[ $TX_SERVICE == apt-timers && $TX_RECOVERY_INCOMPLETE == 1 ]]
+      [[ -f $STATE_DIR/tx-0 ]]
+      [[ ${FAILED_CHECKS[*]} == *'rollback incomplete'* ]]
+    fi
+  fi
+  printf 'RESULT_VERIFIED\n'
+}
+# A failed recovery must exit before subsequent stages can overwrite snapshots.
+# Keep errexit enabled for the actual activation, including enable --now failure.
+trap 'verify_update_result' EXIT
+configure_unattended_upgrades
+printf 'CONFIGURATION_RETURNED\n'
+''', success=recovered, env={'UPDATE_TEST_DIR': str(path), 'INITIAL_ENABLED': initial_enabled,
+          'INITIAL_ACTIVE': initial_active, 'FAULT': fault, 'RECOVERED': str(recovered),
+          'UPDATE_CODENAME': 'noble' if name.startswith('noble-') else 'resolute'})
+        output = result.stdout + result.stderr
+        calls = (path / 'calls').read_text()
+        assert 'RESULT_VERIFIED' in output
+        assert ('CONFIGURATION_RETURNED' in output) == recovered
+        assert ('ERROR at line' in output) == (not recovered)
+        assert not re.search(r'^(stop|restart) apt-daily(?:-upgrade)?\.service$', calls, re.M)
+        if fault:
+            assert ('Rollback completed: apt-timers' in output) == recovered
+        else:
+            config = (path / 'etc/apt/apt.conf.d/90-proms-unattended-upgrades').read_text()
+            assert 'Automatic-Reboot-Time "04:38"' in config
+            for origin in ('-security', '-updates', '-apps-security', '-infra-security'):
+                assert origin in config
+            for unit, clock in (('apt-daily.timer', '02:30'), ('apt-daily-upgrade.timer', '02:50')):
+                config = (path / f'etc/systemd/system/{unit}.d/90-proms-schedule.conf').read_text()
+                assert f'OnCalendar=*-*-* {clock}:00 Europe/Moscow' in config
+                assert 'RandomizedDelaySec=0' in config and 'Persistent=true' in config
+        print(f'PASS: unattended-upgrades transaction MOCK {name}')

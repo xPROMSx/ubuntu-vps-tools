@@ -68,6 +68,11 @@ Syntax checking, `--help` and isolated function mocks are safe validation paths.
 Full execution belongs only in the existing disposable guest workflow. Do not
 weaken safety checks, run host firewall/network commands or reboot a runner.
 
+APT update activation captures all five units, including the unattended-upgrades
+shutdown helper, and removes persistent/runtime masks before enabling it.
+The existing apt-timers transaction verifies exact enabled/active state on
+rollback, preserves running APT workers, and retains recovery files on failure.
+
 ## Access and subsystem invariants
 
 Root authorized_keys is exclusively owned by the updater: validated public data

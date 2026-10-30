@@ -110,6 +110,11 @@ APT children. Empty/EOF input skips attachment without a later prompt. Pro statu
 attachment and service activation stay after the initial upgrade/base packages;
 already attached systems never reattach even with a pre-collected token.
 
+APT update activation captures all five units, including the unattended-upgrades
+shutdown helper, and removes persistent/runtime masks before enabling it.
+The existing apt-timers transaction verifies exact enabled/active state on
+rollback, preserves running APT workers, and retains recovery files on failure.
+
 ## CLI and subsystem reading
 
 With no arguments and TTY stdin/stdout, a one-shot menu selects the existing

@@ -1389,33 +1389,50 @@ ensure_apt_units() {
 
 remember_apt_units() {
   local unit
-  for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service; do
+  for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do
     APT_UNIT_ENABLED[$unit]="$(systemctl is-enabled "$unit" 2>/dev/null || true)"
     APT_UNIT_ACTIVE[$unit]="$(systemctl is-active "$unit" 2>/dev/null || true)"
   done
 }
 
 restore_apt_units() {
-  local unit state
+  local unit state current rc=0
   systemctl daemon-reload || return 1
-  for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service; do
+  for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service unattended-upgrades.service; do
     state="${APT_UNIT_ENABLED[$unit]:-}"
+    systemctl unmask "$unit" || rc=1
+    systemctl unmask --runtime "$unit" || rc=1
     # Never interrupt an APT service that may currently be installing packages.
-    if [[ "$unit" == *.timer ]]; then
+    # unattended-upgrades.service is the shutdown helper, not an APT worker.
+    if [[ "$unit" == *.timer || "$unit" == unattended-upgrades.service ]]; then
+      current="$(systemctl is-active "$unit" 2>/dev/null || true)"
       if [[ "${APT_UNIT_ACTIVE[$unit]:-}" == active ]]; then
-        systemctl restart "$unit" || return 1
-      else
-        systemctl stop "$unit" || return 1
-      fi
-      if [[ "$state" == disabled || "$state" == masked* ]]; then
-        systemctl disable "$unit" || return 1
+        if [[ "$unit" == *.timer ]]; then
+          systemctl restart "$unit" || rc=1
+        elif [[ "$current" != active ]]; then
+          systemctl start "$unit" || rc=1
+        fi
+      elif [[ "$current" != "${APT_UNIT_ACTIVE[$unit]:-}" ]]; then
+        systemctl stop "$unit" || rc=1
       fi
     fi
     case "$state" in
-      masked) systemctl mask "$unit" || return 1 ;;
-      masked-runtime) systemctl mask --runtime "$unit" || return 1 ;;
+      enabled) systemctl enable "$unit" || rc=1 ;;
+      enabled-runtime)
+        systemctl disable "$unit" || rc=1
+        systemctl enable --runtime "$unit" || rc=1
+        ;;
+      disabled|masked|masked-runtime) systemctl disable "$unit" || rc=1 ;;
     esac
+    case "$state" in
+      masked) systemctl mask "$unit" || rc=1 ;;
+      masked-runtime) systemctl mask --runtime "$unit" || rc=1 ;;
+    esac
+    # A concurrent APT operation must be preserved, but is not an exact rollback.
+    [[ "$(systemctl is-enabled "$unit" 2>/dev/null || true)" == "$state" ]] || rc=1
+    [[ "$(systemctl is-active "$unit" 2>/dev/null || true)" == "${APT_UNIT_ACTIVE[$unit]:-}" ]] || rc=1
   done
+  return "$rc"
 }
 
 verify_apt_timer() {
@@ -1555,20 +1572,20 @@ if bad:
     sys.exit(1)
 PY
   then
-    rollback_transaction
+    if ! rollback_transaction; then
+      TX_RECOVERY_INCOMPLETE=1
+      fail_check "APT rollback incomplete; recovery files retained in $STATE_DIR"
+    fi
     fail_check "Effective unattended-upgrades settings were overridden; inspect apt-config dump"
     summary_set updates fail "Effective unattended-upgrades settings were overridden"
-    return 0
+    return "$TX_RECOVERY_INCOMPLETE"
   fi
-  if ! configure_apt_timers; then
-    rollback_transaction
-    fail_check "Effective APT timer schedule is invalid; previous files and timer states restored"
-    summary_set updates fail "Effective APT timer schedule is invalid"
-    return 0
-  fi
-  systemctl enable --now unattended-upgrades
-
-  if systemctl is-active --quiet unattended-upgrades &&
+  if configure_apt_timers &&
+     systemctl unmask unattended-upgrades.service &&
+     systemctl unmask --runtime unattended-upgrades.service &&
+     systemctl enable --now unattended-upgrades.service &&
+     [[ "$(systemctl is-enabled unattended-upgrades.service)" == enabled ]] &&
+     systemctl is-active --quiet unattended-upgrades.service &&
      systemctl is-active --quiet apt-daily.timer &&
      systemctl is-active --quiet apt-daily-upgrade.timer; then
     commit_transaction
@@ -1576,10 +1593,16 @@ PY
     summary_set updates ok "enabled; reboot time ${AUTO_REBOOT_TIME} ${TIMEZONE}"
     pass_check "APT timers: 02:30 and 02:50 Europe/Moscow, no random delay, persistent"
   else
-    rollback_transaction
-    fail_check "unattended-upgrades or its APT timers are not active"
-    summary_set updates fail "unattended-upgrades or its APT timers are not active"
+    if rollback_transaction; then
+      fail_check "Automatic updates activation/verification failed; previous files and unit states restored"
+    else
+      TX_RECOVERY_INCOMPLETE=1
+      fail_check "Automatic updates activation/verification failed; APT rollback incomplete; recovery files retained in $STATE_DIR"
+    fi
+    summary_set updates fail "Automatic updates activation/verification failed"
   fi
+  # Do not let later transactions overwrite snapshots after incomplete recovery.
+  return "$TX_RECOVERY_INCOMPLETE"
 }
 
 detect_ssh_ports() {
