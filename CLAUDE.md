@@ -39,6 +39,9 @@ separate APK/runtime Xray versions, confirmation, narrow package plans and
 configuration/service states. Do not integrate with Ubuntu or run real router
 installation from development/CI. Use ash syntax, ShellCheck and the isolated
 `tests/openwrt` suite, which does not prove real OpenWrt behavior.
+Use the signed APK feed for `install`/ASU recovery, official GitHub Release
+APKs with SHA-256 verification for `update`, and GitHub Latest plus local state
+for read-only `check`. Keep these paths independent.
 
 The script parses arguments, requires root, validates inputs and the exact OS
 version/codename, acquires the existing flock and creates its temporary state

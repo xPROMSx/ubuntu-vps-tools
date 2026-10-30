@@ -5,6 +5,7 @@ These tests do not install OpenWrt or validate real repository signatures.
 import hashlib
 import json
 import os
+import pty
 from pathlib import Path
 import re
 import shutil
@@ -17,7 +18,7 @@ SOURCE = (REPO / 'openwrt/passwall2-apk-repo.sh').read_text()
 MAIN = 'luci-app-passwall2'
 PW = '26.10.29-r1'
 XR = '26.10.21-r1'
-COMPONENTS = ['chinadns-ng', 'dnsmasq-full', 'kmod-nft-socket', 'kmod-nft-tproxy', 'kmod-nft-nat']
+COMPONENTS = ['geoview', 'kmod-nft-socket', 'kmod-nft-tproxy']
 BUSYBOX = os.environ.get('BUSYBOX', shutil.which('busybox'))
 if not BUSYBOX:
     raise RuntimeError('BusyBox ash is required (install busybox or set BUSYBOX).')
@@ -50,7 +51,7 @@ class ManagerTests(unittest.TestCase):
         self.put('usr/bin/xray', '#!/bin/sh\necho "Xray 26.10.25 fixture"\n', True)
         self.put('usr/lib/lua/luci/passwall2/util_xray.lua', 'local xray_min_version = "26.7.11"\n')
         mock = REPO / 'tests/openwrt/mock.py'
-        for name in ['id', 'df', 'uci', 'apk', 'jsonfilter', 'wget', 'sleep']:
+        for name in ['id', 'df', 'uci', 'apk', 'jsonfilter', 'wget', 'sleep', 'dnsmasq', 'nslookup']:
             (self.root / 'bin' / name).symlink_to(mock)
         for svc in self.state['services']:
             (self.root / 'etc/init.d' / svc).symlink_to(mock)
@@ -68,7 +69,8 @@ class ManagerTests(unittest.TestCase):
         # Some BusyBox builds prefer their own applets over PATH executables.
         # Shell functions keep command doubles authoritative in both ash builds.
         doubles = '\n'.join(f'{name}() {{ "$PW_TEST_ROOT/bin/{name}" "$@"; }}'
-                            for name in ['id', 'df', 'uci', 'apk', 'jsonfilter', 'wget', 'sleep'])
+                            for name in ['id', 'df', 'uci', 'apk', 'jsonfilter', 'wget', 'sleep', 'dnsmasq', 'nslookup'])
+        doubles += '\ntimeout() { shift; "$@"; }'
         translated = ''.join(lines).replace('set -eu\n', 'set -eu\n' + doubles + '\n', 1)
         self.script.write_text(translated.replace(
             '52802b143489214e13b78f96599a147a638205cc22d9dd6d71229504e38ddc00',
@@ -95,12 +97,12 @@ class ManagerTests(unittest.TestCase):
         (self.root / 'proc/101/cmdline').write_bytes(b'')
         self.plan([('Installing', MAIN, PW)])
 
-    def run_manager(self, *args, answer='yes\n', snippet=None):
+    def run_manager(self, *args, answer='yes\n', snippet=None, cwd=None):
         (self.root / 'state.json').write_text(json.dumps(self.state))
         cmd = [BUSYBOX, 'ash', str(self.script), *args]
         if snippet is not None:
             cmd = [BUSYBOX, 'ash', '-c', 'PW2_SOURCE_ONLY=1 . "$1"; ' + snippet, 'test', str(self.script)]
-        result = subprocess.run(cmd, env=self.env, input=answer, text=True, capture_output=True, timeout=20)
+        result = subprocess.run(cmd, env=self.env, input=answer, text=True, capture_output=True, timeout=20, cwd=cwd)
         self.state = json.loads((self.root / 'state.json').read_text())
         self.calls = [json.loads(s) for s in (self.root / 'calls.jsonl').read_text().splitlines()] if (self.root / 'calls.jsonl').exists() else []
         self.output = result.stdout + result.stderr
@@ -108,28 +110,255 @@ class ManagerTests(unittest.TestCase):
 
     def assert_no_mutation(self):
         self.assertEqual(self.state.get('commits', 0), 0)
-        self.assertFalse([c for c in self.calls if c[0] in self.state['services'] and c[1][0] not in ('enabled', 'running')])
+        self.assertFalse([c for c in self.calls if c[0] in self.state['services'] and c[1][0] not in ('enabled', 'running', '--version')])
 
-    def test_default_summary_and_commands(self):
+    def test_noninteractive_no_arguments_is_safe(self):
         result = self.run_manager()
         self.assertEqual(result.returncode, 0, self.output)
-        for text in [PW, XR, '26.10.25', 'APK installed:', 'Runtime:', 'Result: Уже актуально', 'Commands:', 'sh /root/passwall2-apk-repo.sh check install']:
-            self.assertIn(text, self.output)
+        self.assertIn('терминал', self.output)
+        self.assertEqual(self.calls, [])
+
+    def test_menu_invalid_input_and_exit_do_not_touch_system(self):
+        (self.root / 'state.json').write_text(json.dumps(self.state))
+        master, slave = pty.openpty()
+        try:
+            proc = subprocess.Popen([BUSYBOX, 'ash', str(self.script)], stdin=slave, stdout=slave, stderr=slave, env=self.env)
+            os.close(slave)
+            os.write(master, b'x\n4\n')
+            proc.wait(timeout=10)
+            output = b''
+            while True:
+                try:
+                    block = os.read(master, 8192)
+                    if not block:
+                        break
+                    output += block
+                except OSError:
+                    break
+            text = output.decode()
+            self.assertEqual(proc.returncode, 0, text)
+            for label in ('PASSWALL2 MANAGER', '1. Установка', '2. Обновление', '3. Проверка обновлений', '4. Выход', 'Некорректный выбор'):
+                self.assertIn(label, text)
+            self.assertFalse((self.root / 'calls.jsonl').exists())
+        finally:
+            os.close(master)
+
+    def test_menu_check_returns_and_eof_exits(self):
+        (self.root / 'state.json').write_text(json.dumps(self.state))
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        (self.root / 'state.json').write_text(json.dumps(self.state))
+        master, slave = pty.openpty()
+        try:
+            proc = subprocess.Popen([BUSYBOX, 'ash', str(self.script)], stdin=slave, stdout=slave, stderr=slave, env=self.env)
+            os.close(slave)
+            os.write(master, b'3\n\n4\n')
+            proc.wait(timeout=15)
+            output = b''
+            while True:
+                try:
+                    block = os.read(master, 8192)
+                    if not block:
+                        break
+                    output += block
+                except OSError:
+                    break
+            text = output.decode()
+            self.assertEqual(proc.returncode, 0, text)
+            self.assertIn('Доступно обновление', text)
+            self.assertIn('Нажмите Enter', text)
+            self.assertGreaterEqual(text.count('PASSWALL2 MANAGER'), 2)
+            self.assertEqual(json.loads((self.root / 'state.json').read_text()).get('commits', 0), 0)
+        finally:
+            os.close(master)
+
+        master, slave = pty.openpty()
+        try:
+            proc = subprocess.Popen([BUSYBOX, 'ash', str(self.script)], stdin=slave, stdout=slave, stderr=slave, env=self.env)
+            os.close(slave)
+            os.write(master, b'\x04')
+            proc.wait(timeout=10)
+            self.assertEqual(proc.returncode, 0)
+        finally:
+            os.close(master)
+
+    def test_check_reports_latest_without_feed_or_mutation(self):
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        result = self.run_manager('check')
+        self.assertEqual(result.returncode, 0, self.output)
+        self.assertIn('Доступно обновление', self.output)
+        self.assertIn(PW, self.output)
+        self.assertIn('26.10.25', self.output)
         self.assert_no_mutation()
+        self.assertFalse(any(c[0] == 'apk' and any(x in c[1] for x in ('update', 'add', 'fix')) for c in self.calls))
+        self.assertFalse(any(c[0] == 'wget' and 'sourceforge' in c[1][-1] for c in self.calls))
+
+    def test_api_error_is_not_current(self):
+        self.state['api_failure'] = True
+        result = self.run_manager('check')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Не удалось проверить обновления', self.output)
+        self.assertIn('26.10.25', self.output)
+        self.assertNotIn('Уже актуально', self.output)
+        self.assert_no_mutation()
+
+    def test_missing_and_newer_versions_do_not_offer_downgrade(self):
+        del self.state['installed'][MAIN]
+        result = self.run_manager('check')
+        self.assertEqual(result.returncode, 0, self.output)
+        self.assertIn('не установлен', self.output)
+        self.state['installed'][MAIN] = '26.11.1-r1'
+        result = self.run_manager('check')
+        self.assertEqual(result.returncode, 0, self.output)
+        self.assertIn('новее', self.output)
+        self.assert_no_mutation()
+
+    def test_bad_digest_blocks_update_before_simulation(self):
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        self.state['bad_digest'] = True
+        result = self.run_manager('update')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('SHA-256', self.output)
+        self.assertFalse(any(c[0] == 'apk' and 'add' in c[1] for c in self.calls))
+        self.assert_no_mutation()
+
+    def test_incompatible_xray_blocks_update(self):
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        self.state['minimum'] = '27.0.0'
+        result = self.run_manager('update')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('несовместим', self.output)
+        self.assert_no_mutation()
+
+    def test_dnsmasq_replacement_preserves_dhcp_and_service(self):
+        self.state['dns_without_nftset'] = True
+        self.state['installed']['dnsmasq'] = '2.90-r1'
+        self.state['services']['dnsmasq'] = dict(enabled=True, running=True)
+        self.state['closure'].append('dnsmasq-full')
+        original = (self.root / 'etc/config/dhcp').read_bytes()
+        self.plan([('Purging', 'dnsmasq', '2.90-r1'), ('Installing', 'dnsmasq-full', '2.91-r1')])
+        result = self.run_manager('install')
+        self.assertEqual(result.returncode, 0, self.output)
+        self.assertIn('dnsmasq-full', self.output)
+        self.assertEqual((self.root / 'etc/config/dhcp').read_bytes(), original)
+        self.assertEqual(self.state['services']['dnsmasq'], dict(enabled=True, running=True))
+        self.assertTrue(any(c[0] == 'nslookup' for c in self.calls))
+
+    def test_dns_query_failure_is_not_reported_as_success(self):
+        self.state['dns_without_nftset'] = True
+        self.state['dns_query_failure'] = True
+        self.state['installed']['dnsmasq'] = '2.90-r1'
+        self.state['services']['dnsmasq'] = dict(enabled=True, running=True)
+        self.state['closure'].append('dnsmasq-full')
+        self.plan([('Purging', 'dnsmasq', '2.90-r1'), ('Installing', 'dnsmasq-full', '2.91-r1')])
+        result = self.run_manager('install')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('DNS query failed', self.output)
+        self.assertNotIn('Готово.', self.output)
+        self.assertTrue((self.root / 'root/passwall2-apk-backup/config.tgz').exists())
+
+    def test_missing_library_is_cached_then_plan_is_rechecked(self):
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        self.state['offline_needs_cache'] = True
+        self.plan([('Installing', 'libexample', '1.0-r1'), ('Upgrading', MAIN, PW)])
+        result = self.run_manager('update')
+        self.assertEqual(result.returncode, 0, self.output)
+        self.assertTrue(self.state.get('cached'))
+        self.assertEqual(self.state['installed']['libexample'], '1.0-r1')
+        self.assertTrue(any(c[0] == 'apk' and 'cache' in c[1] and 'libexample=1.0-r1' in c[1] for c in self.calls))
+        self.assertTrue(any(c[0] == 'apk' and 'verify' in c[1] and '--allow-untrusted' not in c[1] for c in self.calls))
+
+    def test_unsigned_dependency_blocks_update(self):
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        self.state['offline_needs_cache'] = True
+        self.state['bad_dependency_signature'] = True
+        self.plan([('Installing', 'libexample', '1.0-r1'), ('Upgrading', MAIN, PW)])
+        result = self.run_manager('update')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Подпись зависимости не подтверждена', self.output)
+        self.assert_no_mutation()
+
+    def test_signed_fetch_uses_name_url_despite_exact_fetch_failure(self):
+        self.asu_install()
+        self.state['standalone_untrusted'] = True
+        result = self.run_manager('install')
+        self.assertEqual(result.returncode, 0, self.output)
+        fetches = [c for c in self.calls if c[0] == 'apk' and 'fetch' in c[1]]
+        self.assertTrue(fetches)
+        self.assertTrue(all(c[1][-1] == MAIN and '--keys-dir' in c[1] and '--allow-untrusted' not in c[1] for c in fetches))
+        self.assertTrue(any('--url' not in c[1] and '--output' in c[1] for c in fetches))
+        self.assertFalse(any(c[0] == 'apk' and 'verify' in c[1] for c in self.calls))
+        extracts = [c for c in self.calls if c[0] == 'apk' and 'extract' in c[1]]
+        self.assertEqual(len(extracts), 1)
+        args = extracts[0][1]
+        self.assertIn('--allow-untrusted', args)
+        self.assertIn('--keys-dir', args)
+        self.assertEqual(Path(args[args.index('--destination') + 1]).name, 'extracted')
+        self.assertTrue(all('extract' in c[1] for c in self.calls
+                            if c[0] == 'apk' and '--allow-untrusted' in c[1]))
+
+    def test_signed_url_with_existing_local_apk_uses_simulation_and_output_dir(self):
+        archive = self.root / (MAIN + '-' + PW + '.apk')
+        archive.write_bytes(b'x' * 366525)
+        self.asu_install()
+        before = set(self.root.glob('*.apk'))
+        result = self.run_manager('install', cwd=self.root)
+        self.assertEqual(result.returncode, 0, self.output)
+        self.assertEqual(set(self.root.glob('*.apk')), before)
+        self.assertEqual(archive.read_bytes(), b'x' * 366525)
+        fetches = [c for c in self.calls if c[0] == 'apk' and 'fetch' in c[1]]
+        self.assertTrue(fetches)
+        for _, args, _ in fetches:
+            if '--url' in args:
+                self.assertIn('--simulate', args)
+            else:
+                self.assertNotIn('--simulate', args)
+            directory = Path(args[args.index('--output') + 1])
+            self.assertNotEqual(directory, self.root)
+            self.assertEqual(directory.name, 'package')
+            self.assertTrue(directory.is_relative_to(self.root / 'tmp'))
+
+    def test_check_result_colors_for_available_and_current(self):
+        snippet = ("local_status; latest_release() { PW_AVAIL=26.10.29-r1; }; "
+                   "GREEN=$(printf '\\033[32m'); RESET=$(printf '\\033[0m'); check_release")
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        result = self.run_manager(snippet=snippet)
+        self.assertEqual(result.returncode, 0, self.output)
+        self.assertIn('\x1b[32m  Итог: Доступно обновление до ' + PW, self.output)
+        self.state['installed'][MAIN] = PW
+        result = self.run_manager(snippet=snippet)
+        self.assertEqual(result.returncode, 0, self.output)
+        line = next(line for line in result.stdout.splitlines() if 'Итог:' in line)
+        self.assertEqual(line, '  Итог: Уже актуально.')
+
+    def test_signed_fetch_rejects_wrong_source_version_and_signature(self):
+        for setting in ({'signed_url': 'https://example.org/luci-app-passwall2-26.10.29-r1.apk'},
+                        {'signed_version': '26.9.12-r1'}, {'bad_feed_signature': True},
+                        {'corrupt_feed_package': True}, {'feed_download_failure': True},
+                        {'feed_extract_failure': True}):
+            with self.subTest(setting=setting):
+                self.state.update(setting)
+                self.asu_install()
+                result = self.run_manager('install')
+                self.assertNotEqual(result.returncode, 0, self.output)
+                self.assert_no_mutation()
+                for key in setting:
+                    self.state.pop(key)
+
+    def test_late_package_postcheck_failure_reports_unconfirmed_recovery(self):
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        self.state['post_version_mismatch'] = True
+        self.plan([('Upgrading', MAIN, PW)])
+        result = self.run_manager('update')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Service recovery is NOT confirmed', self.output)
+        self.assertNotIn('Готово.', self.output)
+        self.assertTrue((self.root / 'root/passwall2-apk-backup/config.tgz').exists())
 
     def test_root_guard_is_preserved(self):
         self.state['uid'] = 1000
         result = self.run_manager('install')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Run as root.', self.output)
-        self.assert_no_mutation()
-
-    def test_absent_passwall_proposes_install(self):
-        del self.state['installed'][MAIN]
-        self.plan([('Installing', MAIN, PW)])
-        result = self.run_manager()
-        self.assertEqual(result.returncode, 0, self.output)
-        self.assertIn('Требуется установка', self.output)
         self.assert_no_mutation()
 
     def test_current_update_does_not_install_or_restart(self):
@@ -155,7 +384,10 @@ class ManagerTests(unittest.TestCase):
         self.assertFalse(self.state['services']['passwall2_server']['running'])
         commits = [c for c in self.calls if c[0] == 'apk' and 'add' in c[1] and '--simulate' not in c[1]]
         self.assertEqual(len(commits), 1)
-        self.assertIn(MAIN + '=' + PW, commits[0][1])
+        self.assertTrue(any(x.endswith(MAIN + '-' + PW + '.apk') for x in commits[0][1]))
+        self.assertIn('--allow-untrusted', commits[0][1])
+        simulations = [c for c in self.calls if c[0] == 'apk' and 'add' in c[1] and '--simulate' in c[1]]
+        self.assertTrue(any(any(x.endswith(MAIN + '-' + PW + '.apk') for x in c[1]) for c in simulations))
         self.assertFalse(any(a.startswith('xray-core') for a in commits[0][1]))
         self.assertEqual((self.root / 'etc/apk/world').read_text(), 'foreign~1.0\n' + MAIN + '\n')
         self.assertEqual(self.state.get('sleep_calls', 0), 0)
@@ -188,33 +420,6 @@ class ManagerTests(unittest.TestCase):
         self.assertFalse((self.root / 'etc/apk/repositories.d/passwall2.list').exists())
         self.assert_no_mutation()
 
-    def test_network_failure_prints_local_summary_and_commands(self):
-        self.state['network_failure'] = True
-        result = self.run_manager()
-        self.assertNotEqual(result.returncode, 0)
-        for text in ['Не удалось проверить', PW, '26.10.25', 'Commands:']:
-            self.assertIn(text, self.output)
-        self.assert_no_mutation()
-
-    def test_github_api_failure_is_not_repository_failure(self):
-        self.state['api_failure'] = True
-        self.state['installed'][MAIN] = '26.9.12-r1'
-        self.plan([('Upgrading', MAIN, PW)])
-        result = self.run_manager('check')
-        self.assertEqual(result.returncode, 0, self.output)
-        self.assertIn('Prerelease: unknown', self.output)
-        self.assertIn('Обновление доступно', self.output)
-
-    def test_prerelease_requires_explicit_flag(self):
-        self.state['prerelease'] = True
-        self.state['installed'][MAIN] = '26.9.12-r1'
-        self.plan([('Upgrading', MAIN, PW)])
-        result = self.run_manager('check')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('Known prerelease', self.output)
-        result = self.run_manager('check', '--allow-prerelease')
-        self.assertEqual(result.returncode, 0, self.output)
-
     def test_excluded_and_sensitive_plans_blocked(self):
         for pkg in ['sing-box', 'luci-i18n-passwall2-ru', 'haproxy', 'shadowsocks-rust-sslocal', 'kernel', 'firewall4', 'netifd', 'kmod-ath9k']:
             with self.subTest(package=pkg):
@@ -223,14 +428,14 @@ class ManagerTests(unittest.TestCase):
                 result = self.run_manager('update')
                 self.assertNotEqual(result.returncode, 0, self.output)
                 self.assertEqual(self.state.get('commits', 0), 0)
-                self.assertIn('Error:', self.output)
+                self.assertIn('Ошибка:', self.output)
 
     def test_unnecessary_xray_change_blocked(self):
         self.state['installed'][MAIN] = '26.9.12-r1'
         self.plan([('Upgrading', MAIN, PW), ('Upgrading', 'xray-core', XR)])
         result = self.run_manager('update')
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('suitable Xray runtime', self.output)
+        self.assertIn('Небезопасное дополнительное действие', self.output)
         self.assert_no_mutation()
 
     def test_custom_missing_xray_refuses_without_changes(self):
@@ -260,7 +465,7 @@ class ManagerTests(unittest.TestCase):
         result = self.run_manager('check')
         self.assertEqual(result.returncode, 0, self.output)
         downloads = [c for c in self.calls if c[0] == 'wget' and '-O' in c[1]]
-        self.assertEqual([c[2] for c in downloads], [False, True, False, True])
+        self.assertEqual([c[2] for c in downloads], [False, True])
 
     def test_download_failure_precedes_stopping_services(self):
         self.state['installed'][MAIN] = '26.9.12-r1'
@@ -283,21 +488,6 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('NOT confirmed', self.output)
         self.assertTrue((self.root / 'root/passwall2-apk-backup/config.tgz').exists())
 
-    def test_dns_variant_replacement_preserves_dhcp(self):
-        del self.state['installed']['dnsmasq-full']
-        self.state['installed']['dnsmasq'] = '2.90-r1'
-        self.state['services']['dnsmasq'] = dict(enabled=True, running=True)
-        original = (self.root / 'etc/config/dhcp').read_bytes()
-        self.plan([('Purging', 'dnsmasq', '2.90-r1'), ('Installing', 'dnsmasq-full', '2.91-r1')])
-        result = self.run_manager('install')
-        self.assertEqual(result.returncode, 0, self.output)
-        self.assertEqual((self.root / 'etc/config/dhcp').read_bytes(), original)
-        self.assertEqual(self.state['services']['dnsmasq'], dict(enabled=True, running=True))
-        self.assertNotIn('dnsmasq', self.state['installed'])
-        world = (self.root / 'etc/apk/world').read_text()
-        self.assertNotIn('!dnsmasq', world)
-        self.assertIn('dnsmasq-full\n', world)
-
     def test_previously_disabled_stopped_main_is_preserved(self):
         for enabled, running in [(False, False), (True, False), (False, True)]:
             with self.subTest(enabled=enabled, running=running):
@@ -318,19 +508,8 @@ class ManagerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.state.get('commits'), 1)
         self.assertIn('not confirmed', self.output)
-        self.assertNotIn('Completed.', self.output)
-
-    def test_unknown_minimum_and_downgrade_are_blocked(self):
-        self.state['minimum'] = 'unknown'
-        result = self.run_manager('check')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('Cannot confirm Xray minimum', self.output)
-        self.state['minimum'] = '26.7.11'
-        self.state['installed'][MAIN] = '26.11.1-r1'
-        result = self.run_manager('check')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('downgrade blocked', self.output)
-        self.assert_no_mutation()
+        self.assertIn('Service recovery is NOT confirmed', self.output)
+        self.assertNotIn('Готово.', self.output)
 
     def test_install_preserves_older_working_passwall(self):
         self.state['installed'][MAIN] = '26.9.12-r1'
@@ -357,7 +536,7 @@ class ManagerTests(unittest.TestCase):
                      '(broken) Upgrading luci-app-passwall2 (26.10.29-r1)\nOK: done\n',
                      'OK: done\n']:
             self.state['plan'] = plan
-            result = self.run_manager('check')
+            result = self.run_manager('update')
             self.assertNotEqual(result.returncode, 0, self.output)
             self.assert_no_mutation()
 
@@ -389,6 +568,19 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.state['services']['passwall2'], dict(enabled=True, running=True))
         self.assertEqual(self.state['services']['passwall2_server'], dict(enabled=False, running=False))
         self.assertFalse(any(c[0] == 'passwall2_server' and c[1][0] in ('start', 'restart') for c in self.calls))
+        operations = [c for c in self.calls if c[0] == 'apk' and 'add' in c[1]]
+        self.assertTrue(operations)
+        self.assertTrue(all('--allow-untrusted' not in c[1] for c in operations))
+        self.assertTrue(all('--keys-dir' in c[1] for c in operations))
+
+    def test_install_rejects_optional_core_required_by_plan(self):
+        self.asu_install()
+        self.state['closure'].append('sing-box')
+        self.plan([('Installing', MAIN, PW), ('Installing', 'sing-box', '1.0-r1')])
+        result = self.run_manager('install')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Excluded optional component', self.output)
+        self.assert_no_mutation()
 
     def test_asu_disabled_or_incomplete_config_does_not_start_proxy(self):
         for override in [
@@ -425,7 +617,7 @@ class ManagerTests(unittest.TestCase):
         self.assertEqual(self.state['commits'], 1)
         self.assertEqual(sum(c[0] == 'passwall2' and c[1][0] == 'restart' for c in self.calls), 1)
         self.assertIn('15 second timeout', self.output)
-        self.assertNotIn('Completed.', self.output)
+        self.assertNotIn('Готово.', self.output)
         self.assertTrue((self.root / 'root/passwall2-apk-backup/start-passwall2.log').exists())
 
     def test_all_proxy_modes_disabled_allow_processless_restart(self):

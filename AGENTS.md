@@ -31,6 +31,9 @@ checks, actual Xray runtime handling, explicit confirmation, narrow package
 plans and saved configuration/service state; do not integrate with Ubuntu.
 Validate with ash syntax, ShellCheck and `tests/openwrt` offline regressions.
 These mocks do not prove real OpenWrt behavior.
+Use the signed APK feed for `install`/ASU recovery, official GitHub Release
+APKs with SHA-256 verification for `update`, and GitHub Latest plus local state
+for read-only `check`. Keep these paths independent.
 
 - Root `/root/.ssh/authorized_keys` is exclusively managed: validated keys from
   the configured SSH ID source, one mandatory personal Ed25519 identity and two
