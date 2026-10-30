@@ -277,6 +277,37 @@ class ManagerTests(unittest.TestCase):
         self.assertIn('Подпись зависимости не подтверждена', self.output)
         self.assert_no_mutation()
 
+    def test_signed_fetch_uses_name_url_despite_exact_fetch_failure(self):
+        self.asu_install()
+        result = self.run_manager('install')
+        self.assertEqual(result.returncode, 0, self.output)
+        fetches = [c for c in self.calls if c[0] == 'apk' and 'fetch' in c[1]]
+        self.assertTrue(fetches)
+        self.assertTrue(all('--url' in c[1] and c[1][-1] == MAIN for c in fetches))
+        self.assertTrue(any(c[0] == 'apk' and 'verify' in c[1] for c in self.calls))
+
+    def test_signed_fetch_rejects_wrong_source_version_and_signature(self):
+        for setting in ({'signed_url': 'https://example.org/luci-app-passwall2-26.10.29-r1.apk'},
+                        {'signed_version': '26.9.12-r1'}, {'bad_feed_signature': True}):
+            with self.subTest(setting=setting):
+                self.state.update(setting)
+                self.asu_install()
+                result = self.run_manager('install')
+                self.assertNotEqual(result.returncode, 0, self.output)
+                self.assert_no_mutation()
+                for key in setting:
+                    self.state.pop(key)
+
+    def test_late_package_postcheck_failure_reports_unconfirmed_recovery(self):
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        self.state['post_version_mismatch'] = True
+        self.plan([('Upgrading', MAIN, PW)])
+        result = self.run_manager('update')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Service recovery is NOT confirmed', self.output)
+        self.assertNotIn('Готово.', self.output)
+        self.assertTrue((self.root / 'root/passwall2-apk-backup/config.tgz').exists())
+
     def test_root_guard_is_preserved(self):
         self.state['uid'] = 1000
         result = self.run_manager('install')
@@ -431,6 +462,7 @@ class ManagerTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.state.get('commits'), 1)
         self.assertIn('not confirmed', self.output)
+        self.assertIn('Service recovery is NOT confirmed', self.output)
         self.assertNotIn('Готово.', self.output)
 
     def test_install_preserves_older_working_passwall(self):

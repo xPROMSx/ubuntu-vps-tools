@@ -137,8 +137,11 @@ repository_best() {
     done < "$WORK/versions"
     printf '%s\n' "$best"
 }
+signed_package_url() {
+    apk_run fetch --url "$MAIN" > "$WORK/package-url" 2>/dev/null
+}
 select_targets() {
-    local file needed=0 pkg old
+    local file needed=0 pkg old url name version
     PW_AVAIL=$(repository_best "$MAIN")
     XR_AVAIL=$(repository_best xray-core)
     [ -n "$PW_AVAIL" ] || fail 'No PassWall2 candidate in the signed feed.'
@@ -151,8 +154,19 @@ select_targets() {
     fi
     # Inspect the actual signed candidate, not a release table or mutable main.
     if [ "$TARGET_PW" = "$PW_AVAIL" ]; then
-        network apk_run fetch --output "$WORK/package" "$MAIN=$PW_AVAIL" >/dev/null 2>&1 || fail 'Cannot download signed PassWall2 package for compatibility inspection.'
+        network signed_package_url >/dev/null 2>&1 || fail 'Cannot resolve signed PassWall2 package URL.'
+        url=$(cat "$WORK/package-url")
+        case "$url" in
+            "$BASE_URL/passwall_packages/$MAIN-$PW_AVAIL.apk"|"$BASE_URL/passwall_luci/$MAIN-$PW_AVAIL.apk"|"$BASE_URL/passwall2/$MAIN-$PW_AVAIL.apk") ;;
+            *) block 'Selected APK URL differs from the reviewed signed-feed version/source.';;
+        esac
         file="$WORK/package/$MAIN-$PW_AVAIL.apk"
+        fetch "$file" "$url" || fail 'Cannot download signed PassWall2 package for compatibility inspection.'
+        apk_run verify "$file" >/dev/null 2>&1 || block 'Signed PassWall2 package verification failed.'
+        apk_run adbdump "$file" > "$WORK/package-metadata" 2>/dev/null || block 'Cannot inspect signed APK metadata.'
+        name=$(awk '/^info:$/ {info=1; next} info && /^  name: / {print $2; exit}' "$WORK/package-metadata")
+        version=$(awk '/^info:$/ {info=1; next} info && /^  version: / {print $2; exit}' "$WORK/package-metadata")
+        [ "$name" = "$MAIN" ] && [ "$version" = "$PW_AVAIL" ] || block 'Signed APK identity/version differs from the reviewed candidate.'
         apk_run extract --destination "$WORK/extracted" "$file" >> "$WORK/download.log" 2>&1 || block 'Cannot verify/extract signed PassWall2 package.'
         file="$WORK/extracted/usr/lib/lua/luci/passwall2/util_xray.lua"
     else
@@ -546,7 +560,6 @@ apply() {
         uci -q set firewall.passwall2.path=/var/etc/passwall2.include
         uci -q commit firewall
     fi
-    MAINTENANCE=0
     [ "$COMMIT" = fix ] || unpin_targets
     [ "$MODE" != install ] || persist_repo
     local action pkg version
@@ -582,6 +595,7 @@ apply() {
             timeout 60 "/etc/init.d/$svc" stop || fail "Cannot preserve stopped state: $svc"
         fi
     done < "$WORK/services"
+    MAINTENANCE=0
     info 'Готово. Конфигурация и состояния служб сохранены.'
     info 'Проверьте DNS и выбранные узлы с клиента LAN: локальные проверки не подтверждают доступность.'
     rm -rf "$BACKUP"
@@ -675,7 +689,9 @@ github_asset() {
     LOCAL_APK="$WORK/$MAIN-$PW_AVAIL.apk"
     fetch "$LOCAL_APK" "$url" 2>/dev/null || fail 'Не удалось скачать APK с GitHub.'
     actual=$(wc -c < "$LOCAL_APK" | tr -d ' ')
-    [ "$actual" = "$size" ] && [ "$(sha "$LOCAL_APK")" = "$digest" ] || block 'Размер или SHA-256 APK не совпадает.'
+    if [ "$actual" != "$size" ] || [ "$(sha "$LOCAL_APK")" != "$digest" ]; then
+        block 'Размер или SHA-256 APK не совпадает.'
+    fi
     mkdir -p "$WORK/extracted"
     apk --allow-untrusted extract --destination "$WORK/extracted" "$LOCAL_APK" > "$WORK/extract.log" 2>&1 || block 'Не удалось прочитать проверенный APK.'
     MIN_XRAY=$(sed -n 's/^[[:space:]]*local xray_min_version = "\([0-9.]*\)"[[:space:]]*$/\1/p' "$WORK/extracted/usr/lib/lua/luci/passwall2/util_xray.lua" 2>/dev/null || true)
