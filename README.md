@@ -98,36 +98,23 @@ this does not execute it. The main URL works after merge.
 )
 ```
 
-Without arguments, it checks signed-feed versions, the configured Xray binary
-and proposed changes, then prints all commands even when the network check
-fails. Checks use temporary indexes and do not change packages, persistent
-feeds, world constraints, configuration or services.
+Run `sh /root/passwall2-apk-repo.sh` over an interactive SSH session to open
+its menu. Select **Установка** to install or restore missing components from
+the signed APK feed, **Обновление** to update PassWall2 from the official
+GitHub Release, or **Проверка обновлений** for a read-only GitHub check.
+After an operation or error, press Enter to return to the menu.
 
 ```sh
-sh /root/passwall2-apk-repo.sh
-sh /root/passwall2-apk-repo.sh check
-sh /root/passwall2-apk-repo.sh check install
-sh /root/passwall2-apk-repo.sh install
-sh /root/passwall2-apk-repo.sh update
-sh /root/passwall2-apk-repo.sh status
+sh /root/passwall2-apk-repo.sh check   # first, inspect the local and latest versions
+sh /root/passwall2-apk-repo.sh update  # inspect and confirm the proposed APK plan
+sh /root/passwall2-apk-repo.sh install # install or restore after ASU, with confirmation
+sh /root/passwall2-apk-repo.sh status  # local status only; no network
 sh /root/passwall2-apk-repo.sh help
 ```
 
-`status` and `help` use no network. `check`, `check install`, `install` and
-`update` accept `--allow-prerelease`; known prereleases otherwise block changes
-to PassWall2. An unavailable GitHub API produces an **unknown** release status.
-Changes require confirmation. A suitable Xray binary is preserved even when
-its APK metadata is older. No languages or additional cores are selected.
-Service enable/running states are preserved; a fresh install leaves services
-stopped and disabled for the owner to configure and start.
-After ASU, an absent package/init script with a saved, explicitly enabled main
-proxy and an existing selected node restores main-service autostart and operation.
-Disabled or incomplete saved settings do not trigger this recovery; the server
-is never started automatically from saved configuration alone.
-
-Limitations: repository/key availability, explicit upstream Xray requirements,
-custom binary paths and unusual dependency plans can require manual review.
-SourceForge was inaccessible from development, so the retained key pin and
-live feed still need owner verification before router use. No real router
-installation has been tested. See [OpenWrt notes](openwrt/README.md) for
-provenance, failure handling and offline test limits.
+The GitHub APK is checked against the release asset SHA-256 and installed with
+`--allow-untrusted`; this digest is not an independent developer signature.
+The feed used for installation instead uses the pinned signing key and APK
+signature verification. Xray and Geoview are maintained separately through
+PassWall2; the Xray binary can be newer than its APK record after App Update.
+See [OpenWrt notes](openwrt/README.md) for recovery, limitations and verification.

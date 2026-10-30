@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Offline command doubles. Never invoke a real APK operation or host service."""
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -27,6 +28,9 @@ def runtime(version):
 
 
 def service(name, action):
+    if name == 'dnsmasq' and action == '--version':
+        print('Compile time options: ' + ('' if state.get('dns_without_nftset') else 'nftset'))
+        return 0
     svc = state['services'][name]
     proc = root / 'proc' / {'passwall2': '101', 'passwall2_server': '102', 'dnsmasq': '103'}[name]
     if action in ('enabled', 'running'):
@@ -53,6 +57,8 @@ if command == 'id':
 elif command == 'df':
     print('Filesystem 1024-blocks Used Available Capacity Mounted on')
     print('fixture 9999999 0 9999999 0% /')
+elif command == 'nslookup':
+    sys.exit(1 if state.get('dns_query_failure') else 0)
 elif command == 'sleep':
     assert args == ['1'], 'Only one-second startup polling is expected'
     state['sleep_calls'] = state.get('sleep_calls', 0) + 1
@@ -77,6 +83,13 @@ elif command == 'uci':
 elif command == 'jsonfilter':
     data = json.loads(Path(args[args.index('-i') + 1]).read_text())
     key = args[args.index('-e') + 1][2:]
+    if key == 'assets[*].name':
+        print('\n'.join(a['name'] for a in data['assets']))
+        sys.exit(0)
+    asset = re.fullmatch(r'assets\[(\d+)\]\.(\w+)', key)
+    if asset:
+        print(data['assets'][int(asset[1])].get(asset[2], ''))
+        sys.exit(0)
     if key not in data:
         sys.exit(1)
     value = data[key]
@@ -92,8 +105,19 @@ elif command == 'wget':
         if 'api.github.com' in args[-1]:
             if state.get('api_failure'):
                 sys.exit(1)
-            data = dict(tag_name='26.10.29-1', prerelease=state.get('prerelease', False), draft=False, body=state.get('notes', ''))
+            payload = b'github apk fixture\n'
+            name = 'luci-app-passwall2-26.10.29-r1.apk'
+            digest = hashlib.sha256(payload).hexdigest()
+            if state.get('bad_digest'):
+                digest = '0' * 64
+            data = dict(tag_name='26.10.29-1', prerelease=state.get('prerelease', False), draft=False,
+                        assets=[dict(name=name, size=len(payload), digest='sha256:' + digest,
+                                     browser_download_url='https://github.com/Openwrt-Passwall/openwrt-passwall2/releases/download/26.10.29-1/' + name)])
             dest.write_text(json.dumps(data))
+        elif 'github.com/Openwrt-Passwall/' in args[-1]:
+            if state.get('download_failure'):
+                sys.exit(1)
+            dest.write_bytes(b'github apk fixture\n')
         else:
             dest.write_text('offline signing key fixture\n')
 elif command == 'apk':
@@ -106,7 +130,7 @@ elif command == 'apk':
     while i < len(args):
         if args[i] in ('--repositories-file', '--keys-dir', '--cache-dir', '--timeout'):
             i += 2
-        elif args[i] == '--no-network':
+        elif args[i] in ('--no-network', '--allow-untrusted'):
             i += 1
         else:
             clean.append(args[i])
@@ -148,8 +172,20 @@ elif command == 'apk':
     elif op == 'cache':
         if state.get('download_failure'):
             sys.exit(1)
+        cache = root / 'etc/apk/cache'
+        cache.mkdir(exist_ok=True)
+        for arg in tail:
+            if '=' in arg:
+                name, version = arg.split('=', 1)
+                (cache / f'{name}-{version}.12345678.apk').write_text('signed dependency fixture')
+        state['cached'] = True
+        save()
+    elif op == 'verify':
+        sys.exit(1 if state.get('bad_dependency_signature') else 0)
     elif op in ('add', 'fix'):
         if '--simulate' in tail:
+            if state.get('offline_needs_cache') and '--no-network' in args and not state.get('cached'):
+                sys.exit(1)
             print(state['plan'], end='')
             sys.exit(state.get('simulate_failure', 0))
         state['commits'] = state.get('commits', 0) + 1
@@ -181,9 +217,10 @@ elif command == 'apk':
         for arg in tail:
             if not arg.startswith('--'):
                 world = root / 'etc/apk/world'
-                name = re.split(r'[@=<>~]', arg.lstrip('!'))[0]
+                name = 'luci-app-passwall2' if arg.endswith('.apk') else re.split(r'[@=<>~]', arg.lstrip('!'))[0]
                 lines = [s for s in world.read_text().splitlines() if re.split(r'[@=<>~]', s.lstrip('!'))[0] != name]
-                world.write_text('\n'.join([*lines, arg]) + '\n')
+                entry = name + '><Q1fixture=' if arg.endswith('.apk') else arg
+                world.write_text('\n'.join([*lines, entry]) + '\n')
         save()
     else:
         raise AssertionError(f'Unexpected APK command: {clean}')
