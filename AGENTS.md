@@ -94,6 +94,10 @@ or relax mandatory VM assertions to make a test pass.
 
 ## CLI and subsystem reading
 
+With no arguments and TTY stdin/stdout, a one-shot menu selects the existing
+Pro/reboot flags before system changes; exit/EOF performs no installation.
+Any argument bypasses it. Non-interactive no-argument runs still start directly.
+
 | Option | Contract |
 | --- | --- |
 | `--help`, `-h` | Usage only. |

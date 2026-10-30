@@ -157,6 +157,36 @@ done
 
 }
 
+select_bootstrap_mode() {
+  local choice cyan='' light='' dim='' reset=''
+  if [[ -t 1 && -z "${NO_COLOR+x}" && "${TERM:-}" != dumb ]]; then
+    cyan=$'\033[1;36m'; light=$'\033[1;37m'; dim=$'\033[2m'; reset=$'\033[0m'
+  fi
+  printf '\n%s\n' '============================================================'
+  printf '%s                      UBUNTU VPS TOOLS%s\n' "$cyan" "$reset"
+  printf '%s\n\n' '============================================================'
+  printf '%s  ВЫБЕРИТЕ ДЕЙСТВИЕ%s\n' "$cyan" "$reset"
+  printf '%s\n\n' '------------------------------------------------------------'
+  printf '%s  1. Запуск\n  2. Запуск и Reboot\n  3. Запуск без Pro attach\n  4. Запуск без Pro attach и Reboot%s\n\n' "$light" "$reset"
+  printf '%s  5. Выход%s\n\n' "$dim" "$reset"
+  printf '%s\n' '------------------------------------------------------------'
+  while :; do
+    printf '  Выбор [1-5]: '
+    if ! IFS= read -r choice; then
+      printf '\n'
+      return 1
+    fi
+    case "$choice" in
+      1) CONFIGURE_PRO=1; RUN_REBOOT=0; return 0 ;;
+      2) CONFIGURE_PRO=1; RUN_REBOOT=1; return 0 ;;
+      3) CONFIGURE_PRO=0; RUN_REBOOT=0; return 0 ;;
+      4) CONFIGURE_PRO=0; RUN_REBOOT=1; return 0 ;;
+      5) return 1 ;;
+      *) printf '  Неверный выбор. Введите число от 1 до 5.\n' ;;
+    esac
+  done
+}
+
 require_root() {
   [[ "${EUID}" -eq 0 ]] || die "Run as root: sudo bash $0"
 }
@@ -2119,6 +2149,9 @@ final_report() {
 
 main() {
   parse_args "$@"
+  if (( $# == 0 )) && [[ -t 0 && -t 1 ]]; then
+    select_bootstrap_mode || return 0
+  fi
   require_root
   validate_inputs
   check_os
