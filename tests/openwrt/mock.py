@@ -159,7 +159,10 @@ elif command == 'apk':
         if '=' in tail[-1]:
             print('ERROR: unable to select package', file=sys.stderr)
             sys.exit(1)
-        assert tail == ['--url', 'luci-app-passwall2'], tail
+        assert '--url' in tail and tail[-1] == 'luci-app-passwall2', tail
+        # APK 3.0.5 can skip URL output when a local archive already exists.
+        if '--simulate' not in tail and (Path.cwd() / 'luci-app-passwall2-26.10.29-r1.apk').exists():
+            sys.exit(0)
         print(state.get('signed_url', 'https://master.dl.sourceforge.net/project/openwrt-passwall-build/releases/packages-25.12/x86_64/passwall2/luci-app-passwall2-26.10.29-r1.apk'))
     elif op == 'adbdump':
         print('info:\n  name: luci-app-passwall2\n  version: ' + state.get('signed_version', '26.10.29-r1'))

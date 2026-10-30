@@ -138,7 +138,7 @@ repository_best() {
     printf '%s\n' "$best"
 }
 signed_package_url() {
-    apk_run fetch --url "$MAIN" > "$WORK/package-url" 2>/dev/null
+    apk_run fetch --simulate --url --output "$WORK/package" "$MAIN" > "$WORK/package-url" 2>/dev/null
 }
 select_targets() {
     local file needed=0 pkg old url name version
@@ -665,8 +665,8 @@ check_release() {
     valid_version "$PW_INST" || fail 'Не удалось сравнить установленную версию PassWall2.'
     cmp=$(compare "$PW_INST" "$PW_AVAIL")
     case "$cmp" in
-        '<') printf '%s  Итог: Доступно обновление до %s. Выберите пункт 2.%s\n' "$YELLOW" "$PW_AVAIL" "$RESET";;
-        '=') printf '%s  Итог: Уже актуально.%s\n' "$GREEN" "$RESET";;
+        '<') printf '%s  Итог: Доступно обновление до %s. Выберите пункт 2.%s\n' "$GREEN" "$PW_AVAIL" "$RESET";;
+        '=') info '  Итог: Уже актуально.';;
         '>') printf '%s  Итог: Установленная версия новее GitHub Latest; понижение не предлагается.%s\n' "$YELLOW" "$RESET";;
     esac
 }

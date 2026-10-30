@@ -97,12 +97,12 @@ class ManagerTests(unittest.TestCase):
         (self.root / 'proc/101/cmdline').write_bytes(b'')
         self.plan([('Installing', MAIN, PW)])
 
-    def run_manager(self, *args, answer='yes\n', snippet=None):
+    def run_manager(self, *args, answer='yes\n', snippet=None, cwd=None):
         (self.root / 'state.json').write_text(json.dumps(self.state))
         cmd = [BUSYBOX, 'ash', str(self.script), *args]
         if snippet is not None:
             cmd = [BUSYBOX, 'ash', '-c', 'PW2_SOURCE_ONLY=1 . "$1"; ' + snippet, 'test', str(self.script)]
-        result = subprocess.run(cmd, env=self.env, input=answer, text=True, capture_output=True, timeout=20)
+        result = subprocess.run(cmd, env=self.env, input=answer, text=True, capture_output=True, timeout=20, cwd=cwd)
         self.state = json.loads((self.root / 'state.json').read_text())
         self.calls = [json.loads(s) for s in (self.root / 'calls.jsonl').read_text().splitlines()] if (self.root / 'calls.jsonl').exists() else []
         self.output = result.stdout + result.stderr
@@ -285,6 +285,38 @@ class ManagerTests(unittest.TestCase):
         self.assertTrue(fetches)
         self.assertTrue(all('--url' in c[1] and c[1][-1] == MAIN for c in fetches))
         self.assertTrue(any(c[0] == 'apk' and 'verify' in c[1] for c in self.calls))
+
+    def test_signed_url_with_existing_local_apk_uses_simulation_and_output_dir(self):
+        archive = self.root / (MAIN + '-' + PW + '.apk')
+        archive.write_bytes(b'x' * 366525)
+        self.asu_install()
+        before = set(self.root.glob('*.apk'))
+        result = self.run_manager('install', cwd=self.root)
+        self.assertEqual(result.returncode, 0, self.output)
+        self.assertEqual(set(self.root.glob('*.apk')), before)
+        self.assertEqual(archive.read_bytes(), b'x' * 366525)
+        fetches = [c for c in self.calls if c[0] == 'apk' and 'fetch' in c[1]]
+        self.assertTrue(fetches)
+        for _, args, _ in fetches:
+            self.assertIn('--simulate', args)
+            self.assertIn('--url', args)
+            directory = Path(args[args.index('--output') + 1])
+            self.assertNotEqual(directory, self.root)
+            self.assertEqual(directory.name, 'package')
+            self.assertTrue(directory.is_relative_to(self.root / 'tmp'))
+
+    def test_check_result_colors_for_available_and_current(self):
+        snippet = ("local_status; latest_release() { PW_AVAIL=26.10.29-r1; }; "
+                   "GREEN=$(printf '\\033[32m'); RESET=$(printf '\\033[0m'); check_release")
+        self.state['installed'][MAIN] = '26.9.12-r1'
+        result = self.run_manager(snippet=snippet)
+        self.assertEqual(result.returncode, 0, self.output)
+        self.assertIn('\x1b[32m  Итог: Доступно обновление до ' + PW, self.output)
+        self.state['installed'][MAIN] = PW
+        result = self.run_manager(snippet=snippet)
+        self.assertEqual(result.returncode, 0, self.output)
+        line = next(line for line in result.stdout.splitlines() if 'Итог:' in line)
+        self.assertEqual(line, '  Итог: Уже актуально.')
 
     def test_signed_fetch_rejects_wrong_source_version_and_signature(self):
         for setting in ({'signed_url': 'https://example.org/luci-app-passwall2-26.10.29-r1.apk'},
