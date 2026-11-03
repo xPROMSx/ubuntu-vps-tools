@@ -94,6 +94,7 @@ allowed=(
  'Cannot inspect IPv6 configuration;', 'Provider IPv6 is configured but external IPv6',
  'Current/candidate SSH connection uses IPv6', 'Current SSH address family is unknown;',
  'Temporary IPv6 guard did not provide', 'BBR is not available in this kernel;',
+ 'Kernel IP forwarding is enabled while UFW routed policy is restrictive;',
  'apt-daily.timer is waiting for its running APT service;',
  'apt-daily-upgrade.timer is waiting for its running APT service;',
 )

@@ -1858,11 +1858,11 @@ configure_ufw() {
     summary_set ufw fail "Cannot check forwarding before UFW activation"
     return 0
   fi
+  # Forwarding may be enabled on a VPS without an intentional routed workload.
+  # Preserve routed policy; warn that enabling UFW may disrupt transit traffic.
   if grep -qx 1 <<< "$forwarding" &&
      ! grep -Eq '^DEFAULT_FORWARD_POLICY="?ACCEPT"?$' /etc/default/ufw; then
-    fail_check "Forwarding is active but UFW routed policy is restrictive; preserve routing and enable UFW manually"
-    summary_set ufw fail "Forwarding is active but UFW routed policy is restrictive"
-    return 0
+    warn "Kernel IP forwarding is enabled while UFW routed policy is restrictive; enabling UFW may block forwarded traffic. Review route rules if this VPS routes packets."
   fi
   begin_transaction ufw /etc/default/ufw /etc/ufw/ufw.conf /etc/ufw/user.rules /etc/ufw/user6.rules
   for port in "${DETECTED_SSH_PORTS[@]}"; do
