@@ -23,8 +23,12 @@ or relax mandatory VM assertions to make a test pass.
 
 ## Runtime contracts to preserve
 
-The Ubuntu contracts below apply to `vps-bootstrap-ubuntu24.sh`. The independent
-OpenWrt entry point is `openwrt/passwall2-apk-repo.sh` for OpenWrt 25.12.x / APK 3
+The Ubuntu contracts below apply to `vps-bootstrap-ubuntu24.sh`. Standalone
+`update-sshid` also supports Debian 13 (`trixie`) in addition to Ubuntu
+24.04/26.04. This does not extend bootstrap OS support. Key-only mode leaves
+SSH authorization sources unchanged; hardening verifies a single
+`.ssh/authorized_keys` in effective root `AuthorizedKeysFile`, excluding
+`authorized_keys2`. The independent OpenWrt entry point is `openwrt/passwall2-apk-repo.sh` for OpenWrt 25.12.x / APK 3
 and BusyBox ash. Read `openwrt/README.md` before changing it. Never run a real
 router install/update from development or CI. Preserve signed feeds, read-only
 checks, actual Xray runtime handling, explicit confirmation, narrow package

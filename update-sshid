@@ -456,8 +456,10 @@ main() {
   [[ $EUID -eq 0 ]] || { echo 'ERROR: Run as root' >&2; return 1; }
   # shellcheck disable=SC1091
   . /etc/os-release
-  [[ ${ID:-} == ubuntu && ( ${VERSION_ID:-}:${VERSION_CODENAME:-} == 24.04:noble ||
-     ${VERSION_ID:-}:${VERSION_CODENAME:-} == 26.04:resolute ) ]] || { echo 'ERROR: Ubuntu 24.04/26.04 required' >&2; return 1; }
+  case "${ID:-}:${VERSION_ID:-}:${VERSION_CODENAME:-}" in
+    ubuntu:24.04:noble|ubuntu:26.04:resolute|debian:13:trixie) ;;
+    *) echo 'ERROR: Ubuntu 24.04/26.04 or Debian 13 required' >&2; return 1 ;;
+  esac
   if (( NOPASS )); then
     for cmd in flock sshd systemctl ss python3 systemd-tmpfiles stat sed awk; do
       command -v "$cmd" >/dev/null || { echo "ERROR: Required command missing: $cmd" >&2; return 1; }
@@ -470,6 +472,8 @@ main() {
   if (( NOPASS )); then
     harden_ssh
     echo 'SSH password login disabled; managed key-only policy verified.'
+  else
+    echo 'WARNING: Key-only update does not change SSH authentication; authorized_keys2, other key sources or password login may remain permitted.'
   fi
   echo 'WARNING: Test a new key login in a second SSH session before closing this connection; local validation cannot prove external access.'
 }

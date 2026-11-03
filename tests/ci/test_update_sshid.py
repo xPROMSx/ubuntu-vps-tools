@@ -6,6 +6,7 @@ import pty
 import select
 import time
 import re
+import shlex
 import subprocess
 import tempfile
 
@@ -84,6 +85,38 @@ trap finish_update EXIT;
     payload.write_text((root/'key.pub').read_text())
     run(pre + 'select_action() { NOPASS=0; }; harden_ssh() { exit 99; }; main')
     assert config.read_text() == '# original\n'
+    # Check the standalone OS gate; the bootstrap remains Ubuntu-only.
+    for identity, allowed in (
+        ('ubuntu 24.04 noble', True),
+        ('ubuntu 26.04 resolute', True),
+        ('debian 13 trixie', True),
+        ('debian 12 bookworm', False),
+        ('ubuntu 22.04 jammy', False),
+    ):
+        distro, version, codename = identity.split()
+        isolated_os = mapped(SOURCE).replace(
+            '. /etc/os-release',
+            f'ID={distro} VERSION_ID={version} VERSION_CODENAME={codename}')
+        script.write_text(isolated_os)
+        run(pre + 'select_action() { NOPASS=0; }; update_keys() { :; }; '
+            'finish_update() { :; }; main', allowed)
+    script.write_text(isolated)
+    # A second AuthorizedKeysFile is forbidden after SSH hardening.
+    policy = ('pubkeyacceptedalgorithms ssh-ed25519\n'
+              'pubkeyauthentication yes\n'
+              'passwordauthentication no\n'
+              'kbdinteractiveauthentication no\n'
+              'permitemptypasswords no\n'
+              'x11forwarding no\n'
+              'permitrootlogin prohibit-password\n'
+              'authenticationmethods any\n'
+              'authorizedkeysfile .ssh/authorized_keys\n')
+    check = pre + 'VALID_KEY_TYPES=(ssh-ed25519); ssh_policy_ok '
+    run(check + shlex.quote(policy))
+    run(check + shlex.quote(
+        policy.replace('authorizedkeysfile .ssh/authorized_keys\n',
+                       'authorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\n')),
+        False)
     # Real menu in a controlling PTY; only the operations/dependencies are mocked.
     calls = root/'menu-calls'
     menu = pre + f'''
