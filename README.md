@@ -38,6 +38,8 @@ receive an additional no-remove upgrade after the APT index refresh.
 `update-sshid` uses the bootstrap's managed key set and file format. It replaces
 all foreign/provider authorized_keys entries, backing up the previous file.
 It does not install packages or replace the bootstrap's installed updater.
+The standalone updater supports Ubuntu 24.04/26.04 and Debian 13 (Trixie);
+the bootstrap itself remains Ubuntu-only.
 
 ```bash
 (
@@ -58,9 +60,15 @@ The interactive menu offers:
 3. Exit without changes.
 
 Both working options remove foreign/provider keys from `authorized_keys`.
+Mode 1 does not change SSH authentication: if `authorized_keys2` or other
+authorization sources are configured, they may remain usable. Mode 2 enforces
+`AuthorizedKeysFile .ssh/authorized_keys` for verified root contexts, so
+`authorized_keys2` is not consulted; the file itself is not deleted.
+Other authorization mechanisms (such as `AuthorizedKeysCommand` or trusted
+SSH certificate authorities) require a separate audit.
 On first use, verify a new key login in a second SSH session before closing the
 current one. An interactive terminal is required; `--help` shows usage and
-`--nopass` is no longer accepted. The main URL becomes available after merge;
+`--nopass` is no longer accepted. The standalone updater can be used on the supported server OS;
 do not run installation on a development host.
 
 ## OpenWrt: PassWall2 APK Manager

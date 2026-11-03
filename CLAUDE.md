@@ -33,6 +33,11 @@ current behavior from the older baseline. Keep both guides consistent.
 ## Installation sequence and failure boundaries
 
 The Ubuntu contracts below apply to `vps-bootstrap-ubuntu24.sh`.
+Standalone `update-sshid` supports Debian 13 (`trixie`) alongside Ubuntu
+24.04/26.04. Bootstrap support remains Ubuntu-only. Key-only mode does not
+change SSH authorization sources; hardening verifies a single
+`.ssh/authorized_keys` in effective root `AuthorizedKeysFile`, excluding
+`authorized_keys2`.
 `openwrt/passwall2-apk-repo.sh` is independent, for OpenWrt 25.12.x / APK 3 /
 BusyBox ash. Read `openwrt/README.md`; preserve signed feeds, read-only checks,
 separate APK/runtime Xray versions, confirmation, narrow package plans and
