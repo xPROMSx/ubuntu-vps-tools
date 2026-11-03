@@ -32,6 +32,9 @@ Environment overrides: `TIMEZONE` (server timezone), `AUTO_REBOOT_TIME`
 ignore list), and `UBUNTU_PRO_TOKEN` (optional Pro attachment token).
 The main no-remove dist-upgrade precedes Pro setup; newly enabled ESM repositories
 receive an additional no-remove upgrade after the APT index refresh.
+When inactive UFW is activated, existing IP forwarding with restrictive routed
+policy triggers a warning instead of skipping activation. Forwarded traffic
+may be blocked; the script does not rewrite forwarding or routed defaults.
 
 ## Standalone root SSH keys
 

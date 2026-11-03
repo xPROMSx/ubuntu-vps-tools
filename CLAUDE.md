@@ -110,6 +110,8 @@ Active UFW is audited and preserved, with failed validation still a failed
 check. Inactive activation requires safe existing files, conservatively detected
 live SSH context, IPv4/IPv6 SSH allows, deny incoming/allow outgoing and a
 transient rollback guard. Preserve routed policy and foreign firewall owners.
+Enabled kernel forwarding with restrictive UFW routed policy is a warning, not
+an activation blocker; the script does not rewrite forwarding or routed defaults.
 Fail2ban keeps sshd in normal mode with systemd backend/nftables multiport action.
 Recidive stays disabled; stop only a surviving legacy recidive jail, not other
 jails. Do not add replacements or assume the external application jails exist.

@@ -57,6 +57,47 @@ with tempfile.TemporaryDirectory() as directory:
 assert not re.search(r"^\s*set\s+-(?:[^\s]*x)", SOURCE, re.M)
 print("PASS: help, argument values, OS compatibility and trace/token canary")
 
+
+# Exercise the actual UFW pre-activation gate with mocked firewall commands.
+# This stops before the transaction; no host firewall or sysctl changes are made.
+ufw_gate = re.search(r"^configure_ufw\(\) \{\n.*?^\}", SOURCE, re.M | re.S).group()
+with tempfile.TemporaryDirectory() as directory:
+    root = pathlib.Path(directory)
+    defaults = root / "default-ufw"
+    isolated = ufw_gate.replace("/etc/default/ufw", '"$UFW_TEST_DEFAULTS"')
+    for hook in ("before.init", "after.init"):
+        isolated = isolated.replace(f"/etc/ufw/{hook}", f'"$UFW_TEST_ROOT/{hook}"')
+    for name, forwarding, routed, expect_warning, reach_transaction in (
+        ("off-drop", "0\\n0", "DROP", False, True),
+        ("ipv4-drop", "1\\n0", "DROP", True, True),
+        ("ipv6-drop", "0\\n1", "DROP", True, True),
+        ("both-accept", "1\\n1", "ACCEPT", False, True),
+        ("unavailable", "", "DROP", False, False),
+    ):
+        original = f'MANAGE_BUILTINS=no\nIPV6=yes\nDEFAULT_FORWARD_POLICY="{routed}"\n'
+        defaults.write_text(original)
+        mocks = r'''
+ufw() { [[ $1 != status ]] || { printf 'Status: inactive\n'; return; }; }
+detect_ssh_ports() { DETECTED_SSH_PORTS=(22); CURRENT_SSH_PORT=22; }
+cmp() { :; }
+sysctl() {
+  [[ $FORWARD_TEST_CASE != unavailable ]] || return 1
+  printf '%b\n' "$FORWARD_TEST_VALUES"
+}
+begin_transaction() { echo ACTIVATION_REACHED; exit 0; }
+'''
+        result = run(prefix + isolated + '\n' + mocks + 'configure_ufw',
+                     env={'UFW_TEST_ROOT': str(root), 'UFW_TEST_DEFAULTS': str(defaults),
+                          'FORWARD_TEST_CASE': name, 'FORWARD_TEST_VALUES': forwarding})
+        output = result.stdout + result.stderr
+        assert ('ACTIVATION_REACHED' in output) == reach_transaction
+        assert ('Kernel IP forwarding is enabled while UFW routed policy is restrictive'
+                in output) == expect_warning
+        assert ('FAILED CHECK: Cannot check forwarding before UFW activation' in output) == (
+            name == 'unavailable')
+        assert defaults.read_text() == original
+        print(f'PASS: UFW pre-activation MOCK {name}')
+
 # Isolated swap simulations: redirect only this helper's paths to a disposable
 # directory. No real mkswap/swapon or host configuration writes are performed.
 swap = re.search(r"^configure_swap\(\) \{\n.*?^\}", SOURCE, re.M | re.S).group()

@@ -67,7 +67,9 @@ for read-only `check`. Keep these paths independent.
   administrator firewall is audited without rewriting rules; failed validation
   remains a failed check. Inactive activation requires safe existing rule files,
   IPv4/IPv6 SSH allows, deny-incoming/allow-outgoing policy and the independent
-  rollback guard. Preserve routed policy and foreign firewall owners.
+  rollback guard. Preserve routed policy and foreign firewall owners. Enabled
+  kernel forwarding with restrictive UFW routed policy warns but does not skip
+  activation; the script does not rewrite forwarding or routed defaults.
 - Fail2ban keeps the sshd jail in normal mode with systemd backend and nftables
   multiport action. Recidive is explicitly disabled; a surviving legacy recidive
   jail is stopped individually. Do not stop foreign jails or add recidive replacements.
