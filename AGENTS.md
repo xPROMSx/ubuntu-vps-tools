@@ -121,6 +121,24 @@ shutdown helper, and removes persistent/runtime masks before enabling it.
 The existing apt-timers transaction verifies exact enabled/active state on
 rollback, preserves running APT workers, and retains recovery files on failure.
 
+## Standalone SSH updater reliability
+
+Only menu option 2 waits before key updates: cloud-init running, POSIX/fcntl
+APT/dpkg locks or transitional SSH unit states, at most 300 seconds with 5-second
+checks. Missing cloud-init/lock files are skipped; unreadable state fails safely.
+No active SSH unit is a pre-key refusal. Preserve keys-before-hardening order.
+Retry only unconfirmed listeners (Python status 75) and post-reload activity,
+at most five attempts two seconds apart; never retry malformed/context errors.
+Key download uses three curl retries with a two-second delay and the same TLS limits.
+Preserve both ss flag sets. Keep sanitized diagnostics on failure, suppress
+successful ss stderr, and never publish endpoints, PIDs or key bodies.
+Both options finish with actual key/configuration state and fresh base/root SSH
+password settings. The summary prepares the runtime directory without die and
+uses unknown on failure; it is disk configuration, not proof of external access.
+Presentation flags must not change finish_update recovery decisions or exit codes.
+TTY color is disabled whenever NO_COLOR is set. Offline reliability tests do not
+prove VM behavior; harness failures are distinct from production regressions.
+
 ## CLI and subsystem reading
 
 With no arguments and TTY stdin/stdout, a one-shot menu selects the existing

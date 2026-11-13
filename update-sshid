@@ -9,6 +9,118 @@ TX_KEEP=0
 VALID_KEY_TYPES=()
 DETECTED_SSH_PORTS=()
 SSH_CONTEXTS=()
+SYSTEM_WAIT_SECONDS=300
+SYSTEM_POLL_SECONDS=5
+SSH_CHECK_ATTEMPTS=5
+SSH_RETRY_SECONDS=2
+KEY_DOWNLOAD_RETRIES=3
+KEY_RETRY_SECONDS=2
+WORK=''
+STATE_DIR=''
+DIAG_FILE=''
+KEYS_CHANGED=0
+CONFIG_CHANGED=0
+SUMMARY_ENABLED=0
+FAILURE_REASON=''
+
+message() {
+  local level=$1 color=''; shift
+  if [[ -t 2 && ! -v NO_COLOR ]]; then
+    case "$level" in
+      ОШИБКА) color=$'\033[31m' ;;
+      КРИТИЧНО) color=$'\033[1;31m' ;;
+      ВНИМАНИЕ) color=$'\033[33m' ;;
+      ГОТОВО) color=$'\033[32m' ;;
+    esac
+  fi
+  printf '%s[%s] %s' "$color" "$level" "$*" >&2
+  [[ -z "$color" ]] || printf '\033[0m' >&2
+  printf '\n' >&2
+}
+
+die() { FAILURE_REASON=$*; message ОШИБКА "$*"; exit 1; }
+cleanup() { [[ -z "$WORK" ]] || rm -rf -- "$WORK"; }
+
+system_busy() {
+  local status result rc unit active=0
+  local -a reasons=()
+  if command -v cloud-init >/dev/null; then
+    result=$(cloud-init status --format json 2>/dev/null) || :
+    status=$(python3 -c 'import json,sys; print(json.load(sys.stdin)["status"])' <<< "$result" 2>/dev/null) || return 1
+    case "$status" in
+      running) reasons+=('работает cloud-init') ;;
+      done|disabled|error|'not started') ;;
+      *) return 1 ;;
+    esac
+  fi
+  rc=0
+  result=$(python3 - <<'PY'
+import errno, fcntl, os, sys
+busy = False
+for path in ('/var/lib/dpkg/lock', '/var/lib/dpkg/lock-frontend',
+             '/var/lib/apt/lists/lock', '/var/cache/apt/archives/lock'):
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        continue
+    except OSError:
+        sys.exit(1)
+    try:
+        try:
+            fcntl.lockf(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            if error.errno not in (errno.EACCES, errno.EAGAIN):
+                sys.exit(1)
+            busy = True
+    finally:
+        os.close(fd)
+sys.exit(75 if busy else 0)
+PY
+  ) || rc=$?
+  case "$rc" in
+    0) ;;
+    75) reasons+=('работает менеджер пакетов') ;;
+    *) return 1 ;;
+  esac
+  for unit in ssh.service ssh.socket; do
+    status=$(systemctl show "$unit" -p ActiveState --value 2>/dev/null) || {
+      [[ $(systemctl show "$unit" -p LoadState --value 2>/dev/null || :) == not-found ]] && continue
+      return 1
+    }
+    case "$status" in
+      activating|deactivating|reloading) reasons+=("$unit меняет состояние") ;;
+      active) active=1 ;;
+      inactive|failed) ;;
+      *) return 1 ;;
+    esac
+  done
+  if (( ${#reasons[@]} )); then
+    printf '%s\n' "${reasons[*]}"
+    return 75
+  fi
+  if (( ! active )); then
+    printf '%s\n' 'нет активного SSH-юнита'
+    return 1
+  fi
+}
+
+wait_system_idle() {
+  local reason rc delay deadline=$((SECONDS + SYSTEM_WAIT_SECONDS)) announced=0
+  while :; do
+    rc=0
+    reason=$(system_busy) || rc=$?
+    (( rc != 0 )) || return 0
+    (( rc == 75 )) || die "Нельзя безопасно продолжить: ${reason:-не удалось проверить состояние системы}. Ключи и конфигурация SSH не менялись."
+    if (( ! announced )); then
+      message ВНИМАНИЕ "Система занята: $reason. Ждём завершения, не меняя ключи и конфигурацию SSH."
+      announced=1
+    fi
+    (( SECONDS < deadline )) || die 'Не дождались завершения системных работ. Подождите и запустите снова.'
+    delay=$((deadline - SECONDS))
+    (( delay <= SYSTEM_POLL_SECONDS )) || delay=$SYSTEM_POLL_SECONDS
+    sleep "$delay"
+  done
+}
 usage() {
   printf '%s\n' 'Usage: sudo bash update-sshid' '       bash update-sshid --help' \
     'Interactive menu: 1) update managed root keys only; 2) update keys and disable SSH passwords; 3) exit.' \
@@ -20,7 +132,7 @@ select_action() {
   trap 'exit 130' INT
   if [[ ! -t 0 ]]; then
     if ! { exec 7</dev/tty; } 2>/dev/null || [[ ! -t 7 ]]; then
-      echo 'ERROR: Interactive terminal required; no action performed.' >&2
+      message ОШИБКА 'Нужен интерактивный терминал. Действия не выполнены.'
       return 1
     fi
     input_fd=7
@@ -31,7 +143,7 @@ select_action() {
   while :; do
     printf 'Выберите действие [1-3]: '
     if ! IFS= read -r -u "$input_fd" choice; then
-      echo 'Input closed; no action performed.' >&2
+      message ОШИБКА 'Ввод закрыт. Действия не выполнены.'
       return 1
     fi
     case "$choice" in
@@ -63,24 +175,22 @@ STATIC_KEY_2='sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29
 SSH_DIR=/root/.ssh
 AUTH_KEYS="$SSH_DIR/authorized_keys"
 WORK=''
-cleanup() { [[ -z "$WORK" ]] || rm -rf -- "$WORK"; }
-trap cleanup EXIT
+trap finish_update EXIT
 trap 'exit 130' INT
 trap 'exit 143' TERM
-die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
-[[ $EUID -eq 0 ]] || die 'Run update-sshid as root'
+[[ $EUID -eq 0 ]] || die 'Запустите update-sshid с правами root.'
 
 for cmd in curl ssh-keygen flock mktemp install cmp cp mv chmod chown grep tr date; do
-  command -v "$cmd" >/dev/null || die "Required command not found: $cmd"
+  command -v "$cmd" >/dev/null || die "Не найдена необходимая команда: $cmd"
 done
-[[ ! -L "$SSH_DIR" && ! -L "$AUTH_KEYS" ]] || die 'Refusing symlinked SSH directory/authorized_keys'
-[[ ! -e "$AUTH_KEYS" || -f "$AUTH_KEYS" ]] || die 'authorized_keys must be a regular file'
+[[ ! -L "$SSH_DIR" && ! -L "$AUTH_KEYS" ]] || die 'Каталог SSH или authorized_keys является символической ссылкой. Обновление остановлено.'
+[[ ! -e "$AUTH_KEYS" || -f "$AUTH_KEYS" ]] || die 'authorized_keys должен быть обычным файлом.'
 install -d -m 700 -o root -g root "$SSH_DIR"
-[[ ! -L "$SSH_DIR/.update-sshid-proms.lock" ]] || die 'Refusing symlinked key-update lock'
+[[ ! -L "$SSH_DIR/.update-sshid-proms.lock" ]] || die 'Файл блокировки обновления ключей является символической ссылкой.'
 exec 8>"$SSH_DIR/.update-sshid-proms.lock"
 flock -x 8
 # Recheck under the shared lock. Do not create/touch authorized_keys on failure.
-[[ ! -L "$AUTH_KEYS" && ( ! -e "$AUTH_KEYS" || -f "$AUTH_KEYS" ) ]] || die 'Unsafe authorized_keys path'
+[[ ! -L "$AUTH_KEYS" && ( ! -e "$AUTH_KEYS" || -f "$AUTH_KEYS" ) ]] || die 'Путь authorized_keys небезопасен. Обновление остановлено.'
 WORK=$(mktemp -d "$SSH_DIR/.proms-keys.XXXXXX")
 key_id() {
   local type blob rest
@@ -94,9 +204,9 @@ key_id() {
 }
 validate_key() {
   local id
-  id=$(key_id "$1") || die 'Malformed/unsupported public key (material omitted)'
+  id=$(key_id "$1") || die 'Получен ключ неверного или неподдерживаемого формата. Содержимое скрыто.'
   printf '%s\n' "$id" > "$WORK/one"
-  ssh-keygen -lf "$WORK/one" >/dev/null 2>&1 || die 'OpenSSH rejected a public key (material omitted)'
+  ssh-keygen -lf "$WORK/one" >/dev/null 2>&1 || die 'OpenSSH отклонил ключ. Содержимое скрыто.'
   printf '%s\n' "$id"
 }
 personal_id=$(validate_key "$PERSONAL_KEY")
@@ -104,14 +214,14 @@ printf '%s\n' "$personal_id" > "$WORK/personal"
 : > "$WORK/static"
 for key in "$STATIC_KEY_1" "$STATIC_KEY_2"; do
   id=$(validate_key "$key")
-  [[ "$id" == sk-* ]] || die 'Expected a FIDO2 static key'
-  ! grep -Fqx -- "$id" "$WORK/static" || die 'Duplicate static FIDO2 keys'
+  [[ "$id" == sk-* ]] || die 'Ожидался обязательный ключ FIDO2.'
+  ! grep -Fqx -- "$id" "$WORK/static" || die 'Обнаружены одинаковые обязательные ключи FIDO2.'
   printf '%s\n' "$id" >> "$WORK/static"
 done
 printf 'Downloading SSH ID @proms...\n'
 if ! curl --proto '=https' --proto-redir '=https' --tlsv1.2 --fail --silent --show-error \
-     --location --retry 2 --connect-timeout 10 --max-time 30 "$URL" > "$WORK/raw"; then
-  die 'SSH ID download failed; authorized_keys unchanged'
+     --location --retry "$KEY_DOWNLOAD_RETRIES" --retry-delay "$KEY_RETRY_SECONDS" --connect-timeout 10 --max-time 30 "$URL" > "$WORK/raw"; then
+  die 'Не удалось скачать ключи. authorized_keys не менялся.'
 fi
 tr -d '\r' < "$WORK/raw" > "$WORK/lines"
 : > "$WORK/dynamic"
@@ -121,7 +231,7 @@ while IFS= read -r line || [[ -n "$line" ]]; do
   id=$(validate_key "$line")
   grep -Fqx -- "$id" "$WORK/dynamic" || printf '%s\n' "$id" >> "$WORK/dynamic"
 done < "$WORK/lines"
-[[ -s "$WORK/dynamic" ]] || die 'SSH ID returned no valid keys; authorized_keys unchanged'
+[[ -s "$WORK/dynamic" ]] || die 'Источник не вернул допустимых ключей. authorized_keys не менялся.'
 {
   printf '%s\n' "$SSHID_BEGIN"
   while IFS= read -r id; do
@@ -136,9 +246,9 @@ done < "$WORK/lines"
   printf '%s\n' "$STATIC_END"
 } > "$WORK/new"
 # Verify the final assembled set, including all mandatory managed identities.
-grep -Fqx -- "$personal_id" "$WORK/new" || die 'Required PERSONAL ED25519 identity missing from assembled keys'
+grep -Fqx -- "$personal_id" "$WORK/new" || die 'В наборе отсутствует обязательный личный ключ Ed25519.'
 while IFS= read -r id; do
-  grep -Fqx -- "$id" "$WORK/new" || die 'Required FIDO2 identity missing from assembled keys'
+  grep -Fqx -- "$id" "$WORK/new" || die 'В наборе отсутствует обязательный ключ FIDO2.'
 done < "$WORK/static"
 count=0
 while IFS= read -r line; do
@@ -155,7 +265,7 @@ if cmp -s "$AUTH_KEYS" "$WORK/new"; then
 else
   if [[ -e "$AUTH_KEYS" ]]; then
     for directory in /root/backups /root/backups/vps-bootstrap; do
-      [[ ! -L "$directory" ]] || die 'Refusing symlinked SSH backup directory'
+      [[ ! -L "$directory" ]] || die 'Каталог резервных копий SSH является символической ссылкой.'
       install -d -m 700 -o root -g root "$directory"
     done
     backup=$(mktemp -d "/root/backups/vps-bootstrap/$(date +%Y%m%d-%H%M%S)-$$.XXXXXX")
@@ -166,30 +276,28 @@ else
   fi
   # Both paths are below .ssh: rename is atomic and cannot expose an empty file.
   mv -fT -- "$WORK/new" "$AUTH_KEYS"
+  KEYS_CHANGED=1
   printf 'Proms authorized_keys replaced (%s active keys); provider/unknown keys removed.\n' "$count"
 fi
 printf 'Active key fingerprints (no key bodies):\n'
 ssh-keygen -lf "$AUTH_KEYS" -E sha256
 }
 
-ensure_sshd_runtime_dir() {
+prepare_sshd_runtime_dir() {
   local directory=/run/sshd config=/usr/lib/tmpfiles.d/openssh-server.conf
-  [[ ! -L "$directory" && ( ! -e "$directory" || -d "$directory" ) ]] ||
-    die "Unsafe OpenSSH runtime path: $directory must be a real directory, not a symlink or file"
+  [[ ! -L "$directory" && ( ! -e "$directory" || -d "$directory" ) ]] || return 1
   if [[ -f "$config" ]]; then
-    systemd-tmpfiles --create --prefix="$directory" "$config" ||
-      die "Could not prepare OpenSSH runtime directory through systemd-tmpfiles"
+    systemd-tmpfiles --create --prefix="$directory" "$config" || return 1
   fi
-  # Both LTS ssh.service units specify RuntimeDirectory=sshd, mode 0755.
-  # Their tmpfiles config may be absent or only exclude /tmp/sshauth.*.
-  [[ ! -L "$directory" && ( ! -e "$directory" || -d "$directory" ) ]] ||
-    die "Unsafe OpenSSH runtime path after tmpfiles: $directory"
+  [[ ! -L "$directory" && ( ! -e "$directory" || -d "$directory" ) ]] || return 1
   if [[ ! -d "$directory" || "$(stat -c '%u:%g:%a' -- "$directory")" != 0:0:755 ]]; then
-    install -d -o root -g root -m 0755 -- "$directory" ||
-      die "Could not restore OpenSSH runtime directory ownership/permissions"
+    install -d -o root -g root -m 0755 -- "$directory" || return 1
   fi
-  [[ ! -L "$directory" && -d "$directory" && "$(stat -c '%u:%g:%a' -- "$directory")" == 0:0:755 ]] ||
-    die "OpenSSH runtime directory verification failed: expected root:root mode 0755"
+  [[ ! -L "$directory" && -d "$directory" && "$(stat -c '%u:%g:%a' -- "$directory")" == 0:0:755 ]]
+}
+
+ensure_sshd_runtime_dir() {
+  prepare_sshd_runtime_dir || die 'Не удалось подготовить безопасный служебный каталог SSH.'
 }
 
 ssh_policy_ok() {
@@ -213,127 +321,160 @@ ssh_policy_ok() {
   grep -qx 'authorizedkeysfile .ssh/authorized_keys' <<< "$effective"
 }
 
-detect_ssh_ports() {
-  local socket="" effective
+detect_ssh_ports_once() {
+  local socket="" effective listen_rc=0 connection_rc=0
+  rm -f -- "$STATE_DIR/ssh-python-error" "$STATE_DIR/ssh-diagnostic" "$STATE_DIR/ss-codes" \
+    "$STATE_DIR/ss-listeners.stderr" "$STATE_DIR/ss-connections.stderr"
   ensure_sshd_runtime_dir
   effective="$(sshd -T)" || return 1
   if systemctl is-active --quiet ssh.socket; then
     socket="$(systemctl show ssh.socket -p Listen --value)" || return 1
     [[ -n "$socket" ]] || return 1
   fi
-  ss -H -ltnp > "$STATE_DIR/ssh-listeners" || return 1
-  ss -H -tnpe > "$STATE_DIR/ssh-connections" || return 1
-  python3 - "$effective" "$socket" "${SSH_CONNECTION:-}" "$STATE_DIR" <<'PY' || return 1
+  ss -H -ltnp > "$STATE_DIR/ssh-listeners" 2> "$STATE_DIR/ss-listeners.stderr" || listen_rc=$?
+  ss -H -tnpe > "$STATE_DIR/ssh-connections" 2> "$STATE_DIR/ss-connections.stderr" || connection_rc=$?
+  printf 'ss -ltnp: %s\nss -tnpe: %s\n' "$listen_rc" "$connection_rc" > "$STATE_DIR/ss-codes"
+  if (( listen_rc || connection_rc )); then
+    printf '%s\n' 'Не удалось получить сведения TCP от ss.' > "$STATE_DIR/ssh-python-error"
+    return 1
+  fi
+  python3 - "$effective" "$socket" "${SSH_CONNECTION:-}" "$STATE_DIR" 2> "$STATE_DIR/ssh-python-error" <<'PY' || return $?
 import ipaddress, os, pathlib, re, sys
-effective, socket, connection, directory = sys.argv[1:]
-root = pathlib.Path(directory)
-def port(value):
-    if not value.isdecimal() or not 1 <= int(value) <= 65535:
-        raise ValueError('Invalid TCP port: ' + value)
-    return int(value)
-def endpoint(value):
-    host, p = value.rsplit(':', 1)
-    return host.strip('[]').split('%')[0], port(p)
-def address(value):
-    ip = ipaddress.ip_address(value)
-    return getattr(ip, 'ipv4_mapped', None) or ip
-configured = {port(p) for p in re.findall(r'^port (\S+)$', effective, re.M)}
-if not configured:
-    raise ValueError('sshd -T returned no ports')
-expected = configured
-if socket:
-    # Socket activation can override sshd Port. Do not open stale config ports.
-    listeners = re.findall(r'(\S+) \(Stream\)', socket)
-    if not listeners:
-        raise ValueError('Cannot parse active ssh.socket listeners')
-    expected = {port(v) if v.isdecimal() else endpoint(v)[1] for v in listeners}
-live = set()
-for line in (root / 'ssh-listeners').read_text().splitlines():
-    fields = line.split()
-    if len(fields) >= 6 and ('"sshd' in line or (socket and '"systemd"' in line)):
-        live.add(endpoint(fields[3])[1])
-if not expected.issubset(live):
-    raise ValueError('Configured SSH ports are not confirmed by live TCP listeners')
-current = '-'
-contexts = []
-def context_for(item):
-    lh, lp, rh, rp = item
-    return f'{rh} {rp} {lh} {lp}'
-if connection:
-    remote, rp, local, lp = connection.split()  # Reject missing/extra fields.
-    rp, lp = port(rp), port(lp)
-    remote, local = address(remote), address(local)
-    if lp not in expected:
-        raise ValueError('Current SSH port disagrees with live SSH listeners')
-    matched = False
-    for line in (root / 'ssh-connections').read_text().splitlines():
-        f = line.split()
-        if len(f) < 6 or f[0] != 'ESTAB' or '"sshd' not in line:
-            continue
-        lh, lport = endpoint(f[3]); rh, rport = endpoint(f[4])
-        if (address(lh), lport, address(rh), rport) == (local, lp, remote, rp):
-            matched = True
-    if not matched:
-        raise ValueError('SSH_CONNECTION is not confirmed by an established sshd connection')
-    current = str(lp)
-    contexts = [connection]
-else:
-    # sudo often strips SSH_CONNECTION. Tie an established socket to an SSH
-    # ancestor by kernel inode or PID, not to an arbitrary user's SSH session.
-    pid = os.getppid()
-    seen, ancestors, inodes = set(), set(), set()
-    remote_context = bool(os.environ.get('SSH_CLIENT') or os.environ.get('SSH_TTY'))
-    while pid > 1 and pid not in seen:
-        seen.add(pid)
-        process = pathlib.Path('/proc', str(pid))
-        status = (process / 'status').read_text()
-        name = re.search(r'^Name:\s*(.*)$', status, re.M).group(1)
-        if name.startswith('sshd'):
-            remote_context = True
-            ancestors.add(pid)
-            try:
-                for fd in (process / 'fd').iterdir():
-                    try:
-                        match = re.fullmatch(r'socket:\[(\d+)\]', os.readlink(fd))
-                        if match:
-                            inodes.add(match[1])
-                    except FileNotFoundError:
-                        pass  # A descriptor may close while ss/proc is sampled.
-            except PermissionError:
-                pass  # The bounded listener fallback below must still validate.
-        pid = int(re.search(r'^PPid:\s*(\d+)$', status, re.M).group(1))
-    if remote_context:
-        matches, established_ports, candidates = set(), set(), set()
+class SshCheckError(ValueError):
+    pass
+class UnconfirmedListeners(ValueError):
+    pass
+try:
+    effective, socket, connection, directory = sys.argv[1:]
+    root = pathlib.Path(directory)
+    def port(value):
+        if not value.isdecimal() or not 1 <= int(value) <= 65535:
+            raise SshCheckError('Некорректный номер TCP-порта.')
+        return int(value)
+    def endpoint(value):
+        host, p = value.rsplit(':', 1)
+        return host.strip('[]').split('%')[0], port(p)
+    def address(value):
+        ip = ipaddress.ip_address(value)
+        return getattr(ip, 'ipv4_mapped', None) or ip
+    configured = {port(p) for p in re.findall(r'^port (\S+)$', effective, re.M)}
+    if not configured:
+        raise SshCheckError('sshd -T не вернул порты.')
+    expected = configured
+    if socket:
+        # Socket activation can override sshd Port. Do not open stale config ports.
+        listeners = re.findall(r'(\S+) \(Stream\)', socket)
+        if not listeners:
+            raise SshCheckError('Не удалось разобрать порты активного ssh.socket.')
+        expected = {port(v) if v.isdecimal() else endpoint(v)[1] for v in listeners}
+    live = set()
+    for line in (root / 'ssh-listeners').read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 6 and ('"sshd' in line or (socket and '"systemd"' in line)):
+            live.add(endpoint(fields[3])[1])
+    details = ['Ожидаемые порты: ' + ', '.join(map(str, sorted(expected))),
+               'Найденные живые порты SSH: ' + ', '.join(map(str, sorted(live)))]
+    for line in (root / 'ssh-listeners').read_text().splitlines():
+        fields = line.split()
+        if len(fields) >= 4:
+            p = endpoint(fields[3])[1]
+            owner = 'sshd' if '"sshd' in line else 'systemd' if '"systemd"' in line else '<другой процесс>'
+            details.append(f'<адрес>:{p}, {owner}')
+    (root / 'ssh-diagnostic').write_text('\n'.join(details) + '\n')
+    if not expected.issubset(live):
+        raise UnconfirmedListeners('Слушатели SSH не подтверждены.')
+    current = '-'
+    contexts = []
+    def context_for(item):
+        lh, lp, rh, rp = item
+        return f'{rh} {rp} {lh} {lp}'
+    if connection:
+        remote, rp, local, lp = connection.split()  # Reject missing/extra fields.
+        rp, lp = port(rp), port(lp)
+        remote, local = address(remote), address(local)
+        if lp not in expected:
+            raise SshCheckError('Порт текущего SSH-сеанса не совпадает с подтверждёнными слушателями.')
+        matched = False
         for line in (root / 'ssh-connections').read_text().splitlines():
             f = line.split()
             if len(f) < 6 or f[0] != 'ESTAB' or '"sshd' not in line:
                 continue
-            lh, lp = endpoint(f[3]); rh, rp = endpoint(f[4])
-            established_ports.add(lp)
-            candidates.add((lh, lp, rh, rp))
-            owners = {int(p) for p in re.findall(r'pid=(\d+)', line)}
-            inode = re.search(r'\bino:(\d+)', line)
-            if owners & ancestors or (inode and inode[1] in inodes):
-                matches.add((lh, lp, rh, rp))
-        if len(matches) == 1:
-            lp = next(iter(matches))[1]
-            if lp not in expected:
-                raise ValueError('Ancestor SSH socket disagrees with live listeners')
-            current = str(lp)
-            contexts = [context_for(next(iter(matches)))]
-            print('Current SSH connection recovered from ancestor socket/PID: TCP ' + current, file=sys.stderr)
-        elif (ancestors and 1 <= len(expected) <= 8 and expected == configured
-              and live == expected and established_ports and established_ports <= expected):
-            # No exact tuple: allow every small, unanimously confirmed listener.
-            # Also reject legacy sessions on ports that no longer listen.
-            current = 'confirmed-listeners'
-            contexts = [context_for(item) for item in sorted(candidates)]
-            print('Exact sudo SSH tuple unavailable; allowing all confirmed SSH TCP ports: '
-                  + ','.join(map(str, sorted(expected))), file=sys.stderr)
-        else:
-            raise ValueError('Cannot recover current SSH socket or a bounded, consistent listener set')
-(root / 'ssh-contexts').write_text(''.join(c + '\n' for c in contexts), newline='\n')
-(root / 'ssh-ports').write_text(current + '\n' + ''.join(str(p)+'\n' for p in sorted(expected)), newline='\n')
+            lh, lport = endpoint(f[3]); rh, rport = endpoint(f[4])
+            if (address(lh), lport, address(rh), rport) == (local, lp, remote, rp):
+                matched = True
+        if not matched:
+            raise SshCheckError('SSH_CONNECTION не подтверждён установленным соединением sshd.')
+        current = str(lp)
+        contexts = [connection]
+    else:
+        # sudo often strips SSH_CONNECTION. Tie an established socket to an SSH
+        # ancestor by kernel inode or PID, not to an arbitrary user's SSH session.
+        pid = os.getppid()
+        seen, ancestors, inodes = set(), set(), set()
+        remote_context = bool(os.environ.get('SSH_CLIENT') or os.environ.get('SSH_TTY'))
+        while pid > 1 and pid not in seen:
+            seen.add(pid)
+            process = pathlib.Path('/proc', str(pid))
+            status = (process / 'status').read_text()
+            name = re.search(r'^Name:\s*(.*)$', status, re.M).group(1)
+            if name.startswith('sshd'):
+                remote_context = True
+                ancestors.add(pid)
+                try:
+                    for fd in (process / 'fd').iterdir():
+                        try:
+                            match = re.fullmatch(r'socket:\[(\d+)\]', os.readlink(fd))
+                            if match:
+                                inodes.add(match[1])
+                        except FileNotFoundError:
+                            pass  # A descriptor may close while ss/proc is sampled.
+                except PermissionError:
+                    pass  # The bounded listener fallback below must still validate.
+            pid = int(re.search(r'^PPid:\s*(\d+)$', status, re.M).group(1))
+        if remote_context:
+            matches, established_ports, candidates = set(), set(), set()
+            for line in (root / 'ssh-connections').read_text().splitlines():
+                f = line.split()
+                if len(f) < 6 or f[0] != 'ESTAB' or '"sshd' not in line:
+                    continue
+                lh, lp = endpoint(f[3]); rh, rp = endpoint(f[4])
+                established_ports.add(lp)
+                candidates.add((lh, lp, rh, rp))
+                owners = {int(p) for p in re.findall(r'pid=(\d+)', line)}
+                inode = re.search(r'\bino:(\d+)', line)
+                if owners & ancestors or (inode and inode[1] in inodes):
+                    matches.add((lh, lp, rh, rp))
+            if len(matches) == 1:
+                lp = next(iter(matches))[1]
+                if lp not in expected:
+                    raise SshCheckError('Порт SSH-сеанса родительского процесса не совпадает со слушателями.')
+                current = str(lp)
+                contexts = [context_for(next(iter(matches)))]
+                print('Current SSH connection recovered from ancestor socket/PID: TCP ' + current, file=sys.stderr)
+            elif (ancestors and 1 <= len(expected) <= 8 and expected == configured
+                  and live == expected and established_ports and established_ports <= expected):
+                # No exact tuple: allow every small, unanimously confirmed listener.
+                # Also reject legacy sessions on ports that no longer listen.
+                current = 'confirmed-listeners'
+                contexts = [context_for(item) for item in sorted(candidates)]
+                print('Exact sudo SSH tuple unavailable; allowing all confirmed SSH TCP ports: '
+                      + ','.join(map(str, sorted(expected))), file=sys.stderr)
+            else:
+                raise SshCheckError('Не удалось безопасно определить текущий SSH-контекст.')
+    (root / 'ssh-contexts').write_text(''.join(c + '\n' for c in contexts), newline='\n')
+    (root / 'ssh-ports').write_text(current + '\n' + ''.join(str(p)+'\n' for p in sorted(expected)), newline='\n')
+except UnconfirmedListeners as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(75)
+except SshCheckError as error:
+    print(str(error), file=sys.stderr)
+    sys.exit(1)
+except ValueError:
+    print('Не удалось разобрать сведения о портах или SSH-контексте.', file=sys.stderr)
+    sys.exit(1)
+except OSError:
+    print('Не удалось прочитать сведения о SSH.', file=sys.stderr)
+    sys.exit(1)
 PY
   local -a result
   mapfile -t result < "$STATE_DIR/ssh-ports"
@@ -342,31 +483,90 @@ PY
   [[ ${#DETECTED_SSH_PORTS[@]} -gt 0 ]]
 }
 
+save_ssh_diagnostics() {
+  [[ -n "$DIAG_FILE" ]] || DIAG_FILE=$(mktemp /tmp/update-sshid-diagnostics.XXXXXX) || return 1
+  python3 - "$STATE_DIR" >> "$DIAG_FILE" <<'PY'
+import pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+for name in ('ssh-python-error', 'ssh-diagnostic', 'ss-codes',
+             'ss-listeners.stderr', 'ss-connections.stderr'):
+    path = root / name
+    if not path.is_file():
+        continue
+    text = path.read_text(errors='replace')
+    text = re.sub(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', '<адрес>', text)
+    text = re.sub(r'(?:[0-9a-fA-F]{0,4}:){2,}[0-9a-fA-F:%]*', '<адрес>', text)
+    text = re.sub(r'\b[\w-]+(?:\.[\w-]+)+\b', '<имя>', text)
+    text = re.sub(r'\bpid=\d+', '<PID>', text)
+    text = re.sub(r'[A-Za-z0-9+/]{40,}={0,3}', '<данные удалены>', text)
+    if name.endswith('.stderr'):
+        path.write_text(text)  # Recovery retention must not keep raw endpoints either.
+    print(name + ':\n' + text.rstrip())
+PY
+  cat -- "$DIAG_FILE" >&2
+  message ОШИБКА "Диагностика сохранена: $DIAG_FILE"
+}
+
+detect_ssh_ports() {
+  local attempt rc
+  for ((attempt=1; attempt<=SSH_CHECK_ATTEMPTS; attempt++)); do
+    rc=0
+    detect_ssh_ports_once || rc=$?
+    if (( rc == 0 )); then
+      cat -- "$STATE_DIR/ssh-python-error" >&2
+      return 0
+    fi
+    if (( rc != 75 || attempt == SSH_CHECK_ATTEMPTS )); then
+      message ОШИБКА 'Не удалось подтвердить слушатели или текущий SSH-контекст.'
+      save_ssh_diagnostics
+      return 1
+    fi
+    message ВНИМАНИЕ "Слушатели SSH пока не подтверждены. Повтор $((attempt + 1))/$SSH_CHECK_ATTEMPTS через $SSH_RETRY_SECONDS с."
+    sleep "$SSH_RETRY_SECONDS"
+  done
+}
+
+wait_ssh_service_active() {
+  local attempt
+  for ((attempt=1; attempt<=SSH_CHECK_ATTEMPTS; attempt++)); do
+    systemctl is-active --quiet ssh.service && return 0
+    (( attempt < SSH_CHECK_ATTEMPTS )) || break
+    message ВНИМАНИЕ "Ждём активности ssh.service после reload. Повтор $((attempt + 1))/$SSH_CHECK_ATTEMPTS."
+    sleep "$SSH_RETRY_SECONDS"
+  done
+  message ОШИБКА 'Активность ssh.service после reload не подтверждена.'
+  return 1
+}
+
 apply_ssh_runtime_config() {
   # Authentication-only changes: preserve the existing listener architecture.
   # Port/ListenAddress changes would need separate socket/generator handling.
   if systemctl is-active --quiet ssh.socket; then
     if systemctl is-active --quiet ssh.service; then
       systemctl reload ssh.service || return 1
-      systemctl is-active --quiet ssh.service || return 1
+      wait_ssh_service_active || return 1
     fi
     detect_ssh_ports || return 1
     systemctl is-active --quiet ssh.socket || return 1
   elif systemctl is-active --quiet ssh.service; then
     systemctl reload ssh.service || return 1
-    systemctl is-active --quiet ssh.service || return 1
+    wait_ssh_service_active || return 1
     detect_ssh_ports || return 1
     systemctl is-active --quiet ssh.service || return 1
   else
-    printf '%s\n' 'No active OpenSSH listener unit (ssh.socket/ssh.service); refusing to change SSH activation mode automatically' >&2
+    message ОШИБКА 'Нет активного SSH-юнита. Автоматически менять способ запуска SSH нельзя.'
     return 1
   fi
+}
+
+root_ssh_config() {
+  sshd -T -C user=root,host=localhost,addr=127.0.0.1
 }
 
 validate_policy() {
   local effective context remote _rport localaddr localport
   effective=$(sshd -T) && ssh_policy_ok "$effective" || return 1
-  effective=$(sshd -T -C user=root,host=localhost,addr=127.0.0.1) && ssh_policy_ok "$effective" || return 1
+  effective=$(root_ssh_config) && ssh_policy_ok "$effective" || return 1
   for context in "${SSH_CONTEXTS[@]}"; do
     read -r remote _rport localaddr localport <<< "$context"
     effective=$(sshd -T -C "user=root,host=$remote,addr=$remote,laddr=$localaddr,lport=$localport") &&
@@ -374,25 +574,76 @@ validate_policy() {
   done
 }
 
+disk_password_status() {
+  local effective value context remote _rport localaddr localport enabled=0 unknown=0
+  prepare_sshd_runtime_dir >/dev/null 2>&1 || { printf 'неизвестно'; return 0; }
+  local -a commands=(base root)
+  commands+=("${SSH_CONTEXTS[@]}")
+  for context in "${commands[@]}"; do
+    case "$context" in
+      base) effective=$(sshd -T 2>/dev/null) || { unknown=1; continue; } ;;
+      root) effective=$(root_ssh_config 2>/dev/null) || { unknown=1; continue; } ;;
+      *)
+        read -r remote _rport localaddr localport <<< "$context"
+        effective=$(sshd -T -C "user=root,host=$remote,addr=$remote,laddr=$localaddr,lport=$localport" 2>/dev/null) || { unknown=1; continue; }
+        ;;
+    esac
+    value=$(awk '$1 == "passwordauthentication" {print $2}' <<< "$effective")
+    case "$value" in
+      yes) enabled=1 ;;
+      no) ;;
+      *) unknown=1 ;;
+    esac
+  done
+  if (( unknown )); then printf 'неизвестно';
+  elif (( enabled )); then printf 'НЕ ОТКЛЮЧЁН';
+  else printf 'ОТКЛЮЧЁН'; fi
+}
+
+report_update() {
+  local rc=$1 restored=$2 level=ГОТОВО keys='не менялись' config='не менялась' password
+  password=$(disk_password_status)
+  (( ! KEYS_CHANGED )) || keys='обновлены'
+  if (( TX_KEEP )); then
+    level=КРИТИЧНО
+    config="откат НЕ удался, состояние неизвестно, файлы восстановления в $WORK"
+    message "$level" 'Не закрывайте текущую сессию. Требуется ручная проверка SSH.'
+    message "$level" "Проверка: sshd -T | grep -E 'passwordauthentication|permitrootlogin'"
+  elif (( rc )); then
+    level=ОШИБКА
+    (( ! restored )) || config='изменения отменены, прежние настройки восстановлены и проверены'
+    message "$level" "${FAILURE_REASON:-Операция прервана или завершилась с ошибкой.} Не закрывайте текущую сессию; подождите и запустите снова."
+  else
+    (( ! CONFIG_CHANGED )) || config='изменения применены и проверены'
+    message "$level" 'Операция завершена. Проверьте вход по ключу во ВТОРОЙ сессии, не закрывая текущую.'
+  fi
+  if (( ! NOPASS )); then
+    message "$level" 'Вход по паролю не менялся. Для отключения выберите пункт 2.'
+    message ВНИМАНИЕ 'Другие источники ключей и способы входа могли остаться разрешены.'
+  fi
+  message "$level" "Ключи SSH: $keys."
+  message "$level" "Вход по паролю: $password (конфигурация на диске; внешний доступ не проверен)."
+  message "$level" "Конфигурация SSH: $config."
+}
+
 finish_update() {
-  local rc=$?
+  local rc=$? restored=0
   trap - EXIT
   if (( TX_PENDING )); then
     if cp -a -- "$WORK/ssh-main" /etc/ssh/sshd_config &&
        { if [[ -f "$WORK/ssh-drop" ]]; then cp -a -- "$WORK/ssh-drop" /etc/ssh/sshd_config.d/00-proms-hardening.conf;
          else rm -f -- /etc/ssh/sshd_config.d/00-proms-hardening.conf; fi; } &&
        sshd -t && apply_ssh_runtime_config; then
-      echo 'Previous SSH configuration restored and runtime verified.' >&2
+      restored=1
+      message ОШИБКА 'Прежняя конфигурация SSH восстановлена и проверена.'
     else
-      echo "ERROR: SSH recovery incomplete; recovery files retained in $WORK" >&2
+      message КРИТИЧНО "Восстановление SSH не завершено. Файлы восстановления сохранены: $WORK"
       TX_KEEP=1
     fi
     rc=1
   fi
-  if (( rc != 0 && NOPASS )); then
-    echo 'ERROR: Keys were updated, but SSH hardening did not complete successfully.' >&2
-  fi
   if (( ! TX_KEEP )); then cleanup; fi
+  if (( SUMMARY_ENABLED )); then report_update "$rc" "$restored"; fi
   exit "$rc"
 }
 
@@ -400,12 +651,12 @@ harden_ssh() {
   local config=/etc/ssh/sshd_config dropin=/etc/ssh/sshd_config.d/00-proms-hardening.conf
   STATE_DIR=$WORK
   for path in /etc/ssh /etc/ssh/sshd_config.d "$config" "$dropin"; do
-    [[ ! -L "$path" ]] || die 'Refusing symlinked SSH configuration path'
+    [[ ! -L "$path" ]] || die 'Файл или каталог конфигурации SSH является символической ссылкой.'
   done
-  [[ -f "$config" && ( ! -e "$dropin" || -f "$dropin" ) ]] || die 'Expected regular SSH configuration files'
+  [[ -f "$config" && ( ! -e "$dropin" || -f "$dropin" ) ]] || die 'Конфигурация SSH должна состоять из обычных файлов.'
   ensure_sshd_runtime_dir
-  sshd -t || die 'Existing SSH configuration invalid; no SSH changes made'
-  detect_ssh_ports || die 'Cannot verify live SSH listeners/context; no SSH changes made'
+  sshd -t || die 'Исходная конфигурация SSH не прошла проверку. Конфигурация SSH не менялась.'
+  detect_ssh_ports || die 'Не удалось проверить слушатели или текущий SSH-контекст. Конфигурация SSH не менялась.'
   VALID_KEY_TYPES=()
   while read -r type rest; do
     [[ "$type" == \#* || -z "$type" ]] || VALID_KEY_TYPES+=("$type")
@@ -427,16 +678,17 @@ PermitRootLogin prohibit-password
 X11Forwarding no
 EOF
   if cmp -s "$config" "$WORK/main-new" && cmp -s "$dropin" "$WORK/drop-new"; then
-    validate_policy || die 'Existing managed SSH policy conflicts with effective root configuration'
+    validate_policy || die 'Установленная политика SSH конфликтует с действующими настройками root.'
     echo 'Managed SSH hardening already installed; no rewrite or reload.'
     return 0
   fi
   install -d -m 755 /etc/ssh/sshd_config.d
   TX_PENDING=1
+  CONFIG_CHANGED=1
   if ! cmp -s "$config" "$WORK/main-new"; then cat "$WORK/main-new" > "$config"; fi
   if ! cmp -s "$dropin" "$WORK/drop-new"; then install -m 644 "$WORK/drop-new" "$dropin"; fi
   if ! sshd -t || ! validate_policy || ! apply_ssh_runtime_config; then
-    die 'SSH validation/application failed; restoring prior configuration'
+    die 'Проверка или применение SSH завершилось ошибкой. Восстанавливаем прежнюю конфигурацию.'
   fi
   TX_PENDING=0
 }
@@ -446,35 +698,35 @@ main() {
   for arg in "$@"; do
     case "$arg" in
       --help) help=1 ;;
-      *) echo 'ERROR: unknown argument; use --help' >&2; return 1 ;;
+      *) message ОШИБКА 'Неизвестный аргумент. Используйте --help.'; return 1 ;;
     esac
   done
   if (( help )); then usage; return 0; fi
   select_action || selection=$?
   if (( selection == 3 )); then return 0; fi
   (( selection == 0 )) || return "$selection"
-  [[ $EUID -eq 0 ]] || { echo 'ERROR: Run as root' >&2; return 1; }
+  SUMMARY_ENABLED=1
+  trap finish_update EXIT
+  trap 'FAILURE_REASON="Операция прервана."; exit 130' INT
+  trap 'FAILURE_REASON="Операция прервана."; exit 143' TERM
+  [[ $EUID -eq 0 ]] || { message ОШИБКА 'Запустите скрипт с правами root.'; return 1; }
   # shellcheck disable=SC1091
   . /etc/os-release
   case "${ID:-}:${VERSION_ID:-}:${VERSION_CODENAME:-}" in
     ubuntu:24.04:noble|ubuntu:26.04:resolute|debian:13:trixie) ;;
-    *) echo 'ERROR: Ubuntu 24.04/26.04 or Debian 13 required' >&2; return 1 ;;
+    *) message ОШИБКА 'Нужна Ubuntu 24.04/26.04 или Debian 13.'; return 1 ;;
   esac
   if (( NOPASS )); then
     for cmd in flock sshd systemctl ss python3 systemd-tmpfiles stat sed awk; do
-      command -v "$cmd" >/dev/null || { echo "ERROR: Required command missing: $cmd" >&2; return 1; }
+      command -v "$cmd" >/dev/null || { message ОШИБКА "Не найдена необходимая команда: $cmd"; return 1; }
     done
+    wait_system_idle
     exec 9>/run/lock/vps-bootstrap-proms.lock
-    flock -n 9 || { echo 'ERROR: Bootstrap/SSH update already running' >&2; return 1; }
+    flock -n 9 || { message ОШИБКА 'Уже работает bootstrap или обновление SSH.'; return 1; }
   fi
   update_keys
-  trap finish_update EXIT
   if (( NOPASS )); then
     harden_ssh
-    echo 'SSH password login disabled; managed key-only policy verified.'
-  else
-    echo 'WARNING: Key-only update does not change SSH authentication; authorized_keys2, other key sources or password login may remain permitted.'
   fi
-  echo 'WARNING: Test a new key login in a second SSH session before closing this connection; local validation cannot prove external access.'
 }
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then main "$@"; fi

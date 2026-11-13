@@ -60,13 +60,15 @@ def state(unit):
 
 
 def branch(output):
-    if MISSING in output:
+    if MISSING in output or 'Слушатели SSH не подтверждены.' in output:
         return 'unconfirmed-listeners'
     if 'SSH_CONNECTION is not confirmed' in output:
         return 'unconfirmed-connection'
     if 'Current SSH port disagrees' in output:
         return 'connection-port-mismatch'
-    return 'other' if ('ERROR' in output or 'ValueError' in output) else 'none'
+    if 'нет активного SSH-юнита' in output:
+        return 'no-active-unit-preflight'
+    return 'other' if ('ERROR' in output or 'ValueError' in output or '[ОШИБКА]' in output) else 'none'
 
 
 def sample(label):
@@ -216,7 +218,7 @@ def main():
         if (state('ssh.socket') == 'active') != socket:
             raise HarnessError('requested listener fixture not established')
 
-    def outcome(label, before, rc, text):
+    def outcome(label, before, rc, text, require_success=False):
         same_config = CONFIG.read_bytes() == before[0] and not DROP.exists()
         same_keys = KEYS.read_bytes() == before[1]
         # A stopped unit can remove its RuntimeDirectory. Do not confuse that
@@ -232,7 +234,7 @@ def main():
               f'ambiguous-message={ambiguous}', flush=True)
         # Regression contract for phase 2: success, or clean refusal with no edits.
         # Intentionally red on the current unconfirmed-listener failure path.
-        if traceback or ambiguous or (rc == 0 and password != 'no') or (
+        if traceback or ambiguous or (require_success and rc != 0) or (rc == 0 and password != 'no') or (
                 rc != 0 and not (same_config and same_keys)):
             failures.append(label)
             print(f'FAIL: PRODUCTION scenario={label} '
@@ -240,6 +242,11 @@ def main():
 
     try:
         run('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(PAYLOAD))
+        SCENARIO = 'CALM'
+        reset(True)
+        before = (CONFIG.read_bytes(), KEYS.read_bytes())
+        rc, text = menu(lambda: sample('CALM-before-menu'))
+        outcome('CALM', before, rc, text, require_success=True)
         for socket in (True, False):
             label = 'SIMULATION-service-stop' if socket else 'SIMULATION-both-stop'
             SCENARIO = label
@@ -317,6 +324,7 @@ def main():
             SCENARIO = label
             for script in ('update-sshid', 'bootstrap.sh'):
                 bad = 0
+                production_bad = 0
                 reload_errors = 0
                 for _ in range(50):
                     # Parallel reload and detection, followed by immediate post-reload detection.
@@ -330,14 +338,15 @@ def main():
                     after = detect(script)
                     if during.returncode or after.returncode or state('ssh.service') != 'active':
                         bad += 1
+                        production_bad += not reload_result.returncode
                         if bad == 1:
                             sample(label + '-failure')
                             print(f'DIAG: {label}: detector={script} '
                                   f'during-branch={branch(during.stderr)} '
                                   f'after-branch={branch(after.stderr)}', flush=True)
                 print(f'DIAG: {label}: detector={script} iterations=50 failed-pairs={bad} '
-                      f'reload-errors={reload_errors}', flush=True)
-                if bad:
+                      f'reload-errors={reload_errors} valid-failed-pairs={production_bad}', flush=True)
+                if production_bad:
                     failures.append(label + '-' + script)
                     print(f'FAIL: PRODUCTION scenario={label} detector={script} '
                           'expected=all-detections-confirm-listeners', flush=True)

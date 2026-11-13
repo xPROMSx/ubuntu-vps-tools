@@ -40,14 +40,14 @@ reboot scheduling and diagnostic redaction. The existing production ShellCheck
 SC2004 arithmetic-index style finding is excluded explicitly; all other production findings and guest findings
 remain blocking.
 
-## SSH incident reproduction (test-only phase)
+## SSH incident reproduction and reliability
 
 The Ubuntu 24.04 VM runs `guest.sh sshid` before the existing installation stages.
 `sshid_incident.py` uses a real established SSH control connection and a controlling
 PTY to select menu option 2. It sources the exact updater and replaces only `curl`
 with a function returning a public identity generated inside the guest. This is
 an explicit download fixture, not a test of HTTPS, TLS, retries or the external
-key service. Production files are not modified. The separate guest login identity
+key service. The harness does not rewrite production source. The separate guest login identity
 stays outside managed authorized_keys. Raw PTY output and key material are never
 printed or uploaded.
 
@@ -62,17 +62,32 @@ printed or uploaded.
 - **RELOAD MEASUREMENT:** 50 concurrent reload/detect pairs per production
   detector per listener architecture, each followed by an immediate post-reload
   detection. Zero failures is a valid finding, not evidence of an observed race.
+- **CALM:** option 2 must succeed on settled units before the interruption tests.
 
 Diagnostics contain unit states, ports, owner categories, return codes and named
 error branches. Endpoints/PIDs, raw stderr, private configuration and full logs
 are excluded. Configuration and key files are restored between scenarios and on
-exit. All scenarios finish before regression failures are returned: the current
-both-units-stopped path is expected to fail the clean-refusal/no-edits contract
-and expose traceback/ambiguous wording. The Ubuntu 24.04 job and Required may
-therefore be red. Earlier infrastructure failures can prevent these tests from
-running; no CI result has been established merely by adding this stage. Existing
+exit. All scenarios finish before production regression failures are returned.
+Production regressions have explicit `FAIL: PRODUCTION scenario=... expected=...`
+labels. Infrastructure failures use `FAIL: HARNESS` with a safe exception message,
+type and source location. Nonzero reload commands are counted and do not truncate
+the 50 measurements. A runtime directory is prepared before the outcome query;
+sampling still reports a real missing-directory failure without hiding it.
+Earlier infrastructure failures can prevent scenarios from running. Existing
 installation/rerun/reboot assertions remain mandatory after a successful stage.
 Ubuntu 26.04 retains the existing VM sequence.
+
+The maintainer-provided first CI result reproduced the listener failure only in
+the both-units-stop simulation. Service-only stop succeeded with a systemd-owned
+listener. Same-version reinstall held a real dpkg lock but did not reproduce the
+failure. cgroup2 warnings were confined to the connection query. The old harness
+then aborted without completed reload statistics; that abort is not reproduction.
+New CI results must establish completion after these harness/production changes.
+
+`test_sshid_reliability.py` checks parser status separation, bounded retries,
+real fcntl contention in a temporary directory, cloud-init/unit command doubles,
+wait/timeout/signals, recovery summaries and TTY/NO_COLOR behavior offline.
+`test_sshid_incident.py` checks diagnostic redaction and error classification.
 
 Limits: these VMs exercise ext4, QEMU NAT, the supplied kernel and no Pro subscription;
 they do not prove provider-specific networking or an interactive FIDO login.

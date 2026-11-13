@@ -30,6 +30,24 @@ and matching basic/guest tests. Before changing CI or Git validation, also read
 the workflow, VM driver, metadata checker and its synthetic tests. Do not infer
 current behavior from the older baseline. Keep both guides consistent.
 
+## Standalone SSH updater reliability
+
+Only menu option 2 waits before key updates: cloud-init running, POSIX/fcntl
+APT/dpkg locks or transitional SSH unit states, at most 300 seconds with 5-second
+checks. Missing cloud-init/lock files are skipped; unreadable state fails safely.
+No active SSH unit is a pre-key refusal. Preserve keys-before-hardening order.
+Retry only unconfirmed listeners (Python status 75) and post-reload activity,
+at most five attempts two seconds apart; never retry malformed/context errors.
+Key download uses three curl retries with a two-second delay and the same TLS limits.
+Preserve both ss flag sets. Keep sanitized diagnostics on failure, suppress
+successful ss stderr, and never publish endpoints, PIDs or key bodies.
+Both options finish with actual key/configuration state and fresh base/root SSH
+password settings. The summary prepares the runtime directory without die and
+uses unknown on failure; it is disk configuration, not proof of external access.
+Presentation flags must not change finish_update recovery decisions or exit codes.
+TTY color is disabled whenever NO_COLOR is set. Offline reliability tests do not
+prove VM behavior; harness failures are distinct from production regressions.
+
 ## Installation sequence and failure boundaries
 
 The Ubuntu contracts below apply to `vps-bootstrap-ubuntu24.sh`.
