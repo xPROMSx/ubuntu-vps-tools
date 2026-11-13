@@ -11,6 +11,7 @@ import signal
 import subprocess
 import threading
 import time
+import traceback
 
 
 BASE = pathlib.Path('/opt/ci')
@@ -19,13 +20,38 @@ DROP = CONFIG.parent / 'sshd_config.d/00-proms-hardening.conf'
 KEYS = pathlib.Path('/root/.ssh/authorized_keys')
 PAYLOAD = pathlib.Path('/root/ci-sshid-payload')
 MISSING = 'Configured SSH ports are not confirmed by live TCP listeners'
+SCENARIO = 'setup'
+
+
+class HarnessError(RuntimeError):
+    """Only fixed, non-sensitive messages produced by this harness."""
+
+
+def report_exception(error):
+    frames = traceback.extract_tb(error.__traceback__)
+    frame = next((f for f in reversed(frames) if pathlib.Path(f.filename).name == pathlib.Path(__file__).name), None)
+    location = f'sshid_incident.py:{frame.lineno}' if frame else 'guest-harness'
+    if isinstance(error, HarnessError):
+        message = str(error)
+    elif isinstance(error, OSError) and error.errno:
+        message = os.strerror(error.errno)  # Excludes filename and filename2.
+    else:
+        # Arbitrary exception strings may contain endpoints, keys or host names.
+        allowed = set('list index out of range invalid literal for int with base '
+                      'not enough too many values to unpack expected got timed out'.split())
+        message = ' '.join(w if w in allowed else '<redacted>' for w in str(error).split())
+    print(f'FAIL: HARNESS scenario={SCENARIO} type={type(error).__name__} '
+          f'message={message or "<empty>"} location={location}', flush=True)
 
 
 def run(*args, check=True, **kwargs):
     result = subprocess.run(args, capture_output=True, text=True, timeout=120, **kwargs)
     if check and result.returncode:
         # Never forward raw tool errors, configuration, endpoints or key material.
-        raise RuntimeError('guest command failed: ' + args[0])
+        operation = ' '.join(a for a in args[:3] if a in {
+            'systemctl', 'start', 'stop', 'reload', 'disable', 'enable', 'daemon-reload',
+            'ssh.service', 'ssh.socket', 'sshd', '-T', 'ssh-keygen'})
+        raise HarnessError(f'guest command failed: {operation} rc={result.returncode}')
     return result
 
 
@@ -123,11 +149,11 @@ main
                 break
             status = None
         else:
-            raise RuntimeError('menu timeout')
+            raise HarnessError('menu timeout')
         if status is None:
             _, status = os.waitpid(pid, 0)
         if not answered:
-            raise RuntimeError('menu prompt not reached')
+            raise HarnessError('menu prompt not reached')
         return os.waitstatus_to_exitcode(status), output.decode(errors='replace')
     finally:
         os.close(fd)
@@ -156,10 +182,11 @@ def dpkg_busy():
 
 
 def main():
+    global SCENARIO
     if os.geteuid() != 0 or not (BASE / 'disposable-guest').is_file():
-        raise RuntimeError('disposable root guest required')
+        raise HarnessError('disposable root guest required')
     if not os.environ.get('SSH_CONNECTION'):
-        raise RuntimeError('established SSH control connection required')
+        raise HarnessError('established SSH control connection required')
     original = {p: (p.read_bytes(), p.stat().st_mode & 0o777) if p.exists() else None
                 for p in (CONFIG, DROP, KEYS)}
     socket_enabled = run('systemctl', 'is-enabled', 'ssh.socket', check=False).stdout.strip()
@@ -187,11 +214,14 @@ def main():
             run('systemctl', 'start', 'ssh.socket')
         run('systemctl', 'start', 'ssh.service')
         if (state('ssh.socket') == 'active') != socket:
-            raise RuntimeError('requested listener fixture not established')
+            raise HarnessError('requested listener fixture not established')
 
     def outcome(label, before, rc, text):
         same_config = CONFIG.read_bytes() == before[0] and not DROP.exists()
         same_keys = KEYS.read_bytes() == before[1]
+        # A stopped unit can remove its RuntimeDirectory. Do not confuse that
+        # fixture condition with a production regression or abort later measurements.
+        run('bash', '-c', f'source {BASE / "update-sshid"}; ensure_sshd_runtime_dir')
         effective = run('sshd', '-T').stdout
         password = re.search(r'^passwordauthentication (yes|no)$', effective, re.M)[1]
         traceback = 'Traceback (most recent call last)' in text
@@ -205,11 +235,14 @@ def main():
         if traceback or ambiguous or (rc == 0 and password != 'no') or (
                 rc != 0 and not (same_config and same_keys)):
             failures.append(label)
+            print(f'FAIL: PRODUCTION scenario={label} '
+                  'expected=success-or-clean-refusal-without-edits', flush=True)
 
     try:
         run('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(PAYLOAD))
         for socket in (True, False):
             label = 'SIMULATION-service-stop' if socket else 'SIMULATION-both-stop'
+            SCENARIO = label
             reset(socket)
             before = (CONFIG.read_bytes(), KEYS.read_bytes())
             ready = threading.Event()
@@ -228,16 +261,16 @@ def main():
                 # Start threads only after PTY fork, and time the outage from the prompt.
                 worker = pool.submit(stopped_window)
                 if not ready.wait(30):
-                    raise RuntimeError('stop window not established')
+                    raise HarnessError('stop window not established')
                 if state('ssh.service') != 'inactive' or (state('ssh.socket') == 'active') != socket:
-                    raise RuntimeError('requested stop window not observed')
+                    raise HarnessError('requested stop window not observed')
                 sample(label + '-before-menu')
                 for script in ('update-sshid', 'bootstrap.sh'):
                     result = detect(script)
                     print(f'DIAG: {label}: detector={script} rc={result.returncode} '
                           f'branch={branch(result.stderr)}', flush=True)
                 if state('ssh.service') != 'inactive':
-                    raise RuntimeError('stop window ended before menu submission')
+                    raise HarnessError('stop window ended before menu submission')
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
                 rc, text = menu(answer_during_stop)
@@ -245,6 +278,7 @@ def main():
                 worker.result(timeout=120)
             outcome(label, before, rc, text)
 
+        SCENARIO = 'REAL-APT'
         reset(True)
         before = (CONFIG.read_bytes(), KEYS.read_bytes())
         # REAL APT: no stop mocks, package hooks, delayed maintainer scripts or fake locks.
@@ -270,7 +304,7 @@ def main():
             apt_rc = apt.wait(timeout=300)
             print(f'DIAG: REAL-APT: apt-rc={apt_rc} lock-overlap={overlap}', flush=True)
             if apt_rc or not overlap:
-                failures.append('REAL-APT-overlap-not-established')
+                raise HarnessError('real package transaction or lock overlap not established')
             outcome('REAL-APT', before, rc, text)
         finally:
             if apt.poll() is None:
@@ -280,14 +314,19 @@ def main():
         for socket in (True, False):
             reset(socket)
             label = 'reload-socket' if socket else 'reload-service'
+            SCENARIO = label
             for script in ('update-sshid', 'bootstrap.sh'):
                 bad = 0
+                reload_errors = 0
                 for _ in range(50):
                     # Parallel reload and detection, followed by immediate post-reload detection.
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                        reloading = pool.submit(run, 'systemctl', 'reload', 'ssh.service')
+                        # A failed reload is evidence, not an exception that hides
+                        # the remaining iterations and service-only measurements.
+                        reloading = pool.submit(run, 'systemctl', 'reload', 'ssh.service', check=False)
                         during = detect(script)
-                        reloading.result(timeout=120)
+                        reload_result = reloading.result(timeout=120)
+                        reload_errors += bool(reload_result.returncode)
                     after = detect(script)
                     if during.returncode or after.returncode or state('ssh.service') != 'active':
                         bad += 1
@@ -296,9 +335,16 @@ def main():
                             print(f'DIAG: {label}: detector={script} '
                                   f'during-branch={branch(during.stderr)} '
                                   f'after-branch={branch(after.stderr)}', flush=True)
-                print(f'DIAG: {label}: detector={script} iterations=50 failed-pairs={bad}', flush=True)
+                print(f'DIAG: {label}: detector={script} iterations=50 failed-pairs={bad} '
+                      f'reload-errors={reload_errors}', flush=True)
                 if bad:
                     failures.append(label + '-' + script)
+                    print(f'FAIL: PRODUCTION scenario={label} detector={script} '
+                          'expected=all-detections-confirm-listeners', flush=True)
+                if reload_errors:
+                    print(f'FAIL: HARNESS scenario={label} '
+                          'message=reload-command-failed-during-measurement', flush=True)
+                    failures.append('HARNESS-' + label)
     finally:
         restore_files()
         run('systemctl', 'stop', 'ssh.service', 'ssh.socket')
@@ -309,7 +355,7 @@ def main():
         PAYLOAD.unlink(missing_ok=True)
         PAYLOAD.with_suffix('.pub').unlink(missing_ok=True)
     if failures:
-        print('FAIL: SSH incident regression: ' + ', '.join(failures), flush=True)
+        print('FAIL: SSH incident checks: ' + ', '.join(failures), flush=True)
         return 1
     print('PASS: SSH incident regression scenarios completed', flush=True)
     return 0
@@ -319,6 +365,5 @@ if __name__ == '__main__':
     try:
         raise SystemExit(main())
     except Exception as error:
-        # Exception text from external tools/files can contain sensitive data.
-        print('FAIL: SSH incident harness: ' + type(error).__name__, flush=True)
+        report_exception(error)
         raise SystemExit(1)
