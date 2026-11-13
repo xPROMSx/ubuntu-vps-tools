@@ -213,6 +213,7 @@ def main():
             reset(socket)
             before = (CONFIG.read_bytes(), KEYS.read_bytes())
             ready = threading.Event()
+            worker = None
 
             def stopped_window():
                 units = ['ssh.service'] if socket else ['ssh.service', 'ssh.socket']
@@ -223,6 +224,9 @@ def main():
                 run('systemctl', 'start', *reversed(units))
 
             def answer_during_stop():
+                nonlocal worker
+                # Start threads only after PTY fork, and time the outage from the prompt.
+                worker = pool.submit(stopped_window)
                 if not ready.wait(30):
                     raise RuntimeError('stop window not established')
                 if state('ssh.service') != 'inactive' or (state('ssh.socket') == 'active') != socket:
@@ -236,7 +240,6 @@ def main():
                     raise RuntimeError('stop window ended before menu submission')
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                worker = pool.submit(stopped_window)
                 rc, text = menu(answer_during_stop)
                 sample(label + '-after-menu')
                 worker.result(timeout=120)
