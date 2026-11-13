@@ -97,6 +97,8 @@ try:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
     accel = 'kvm' if os.access('/dev/kvm', os.R_OK | os.W_OK) else 'tcg'
+    if accel == 'tcg':
+        record('::warning::KVM is unavailable to the runner user; falling back to TCG')
     record(f'Ubuntu {release}: accelerator={accel}; bootstrap={command("git", "rev-parse", "HEAD")}')
     serial = WORK / 'serial.sock'
     qemu = subprocess.Popen([

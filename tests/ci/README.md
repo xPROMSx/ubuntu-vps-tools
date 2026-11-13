@@ -13,7 +13,11 @@ Images use Canonical's current release image and matching SHA256SUMS over HTTPS;
 image URL, digest, commit and accelerator are recorded. This checks current images,
 not an immutable image snapshot or a cryptographic signature on the manifest.
 
-QEMU uses KVM when accessible and TCG otherwise. Disks, cloud-init data and VM
+QEMU always uses KVM when accessible, with an explicit warning on fallback to
+TCG. CI applies the published KVM udev rule to grant the ordinary runner user
+device access. Apart from installing VM tooling, this device permission rule is
+the only runner configuration change; firewall, network and services stay intact.
+Disks, cloud-init data and VM
 processes are temporary. No runner firewall/systemd/network reconfiguration,
 external secrets, paid services or production VPS are needed. Installed runner
 packages are VM tooling only.

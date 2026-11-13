@@ -180,8 +180,11 @@ Keep the known production SC2004 style exclusion; other findings block CI.
 Fast tests simulate failure/idempotence, Pro skipping, diagnostic redaction and
 reboot scheduling; they do not replace system integration.
 
-QEMU jobs SHA256-check official current Ubuntu 24.04/26.04 amd64 images, use KVM
-when available or TCG otherwise, execute exact HEAD with the default full upgrade,
+VM-тесты в CI всегда используют KVM, когда доступен, с явным предупреждением при откате на TCG.
+The CI udev rule grants the runner user KVM device access without changing its
+firewall, networking or services.
+QEMU jobs SHA256-check official current Ubuntu 24.04/26.04 amd64 images,
+execute exact HEAD with the default full upgrade,
 validate real SSH/DoT/kernel/UFW/Fail2ban/update/swap state, rerun, reboot and rerun.
 The DNS recovery scenario is labelled fault simulation with real restoration.
 The guest-generated private test key never leaves the disposable disk; its

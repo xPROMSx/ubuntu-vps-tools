@@ -164,7 +164,9 @@ system integration. Existing QEMU jobs checksum-verify official current Ubuntu
 24.04/26.04 amd64 images, run the exact PR HEAD with full upgrade, validate real
 SSH/DoT/kernel/UFW/Fail2ban/update/swap state, rerun, reboot and rerun again.
 DNS rollback injection is labelled simulation with real file/service recovery.
-KVM is used when available, otherwise TCG. These tests do not prove provider
+VM-тесты в CI всегда используют KVM, когда доступен, с явным предупреждением при откате на TCG.
+The CI udev rule grants the runner user KVM device access without changing its
+firewall, networking or services. These tests do not prove provider
 networking, XFS activation, paid Pro attachment or real FIDO authentication.
 Guest-only test SSH authority is an expected audit warning; its key is not added
 to managed authorized_keys. Only sanitized diagnostics are artifacts.
