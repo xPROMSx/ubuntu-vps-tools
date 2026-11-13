@@ -36,6 +36,40 @@ reboot scheduling and diagnostic redaction. The existing production ShellCheck
 SC2004 arithmetic-index style finding is excluded explicitly; all other production findings and guest findings
 remain blocking.
 
+## SSH incident reproduction (test-only phase)
+
+The Ubuntu 24.04 VM runs `guest.sh sshid` before the existing installation stages.
+`sshid_incident.py` uses a real established SSH control connection and a controlling
+PTY to select menu option 2. It sources the exact updater and replaces only `curl`
+with a function returning a public identity generated inside the guest. This is
+an explicit download fixture, not a test of HTTPS, TLS, retries or the external
+key service. Production files are not modified. The separate guest login identity
+stays outside managed authorized_keys. Raw PTY output and key material are never
+printed or uploaded.
+
+- **SIMULATION:** real systemd stops for 20 seconds, first ssh.service alone with
+  ssh.socket active, then both units; the units are restarted. Both production
+  detectors run during the window, followed by the real menu operation.
+- **REAL APT:** menu option 2 runs alongside an actual openssh-server reinstall,
+  without fake package commands, delayed package hooks or injected stop behavior.
+  A held fcntl lock establishes package activity at menu submission. This does
+  not guarantee that a short real unpack/restart overlaps the later port check;
+  diagnostics report the observed result without inventing a failure.
+- **RELOAD MEASUREMENT:** 50 concurrent reload/detect pairs per production
+  detector per listener architecture, each followed by an immediate post-reload
+  detection. Zero failures is a valid finding, not evidence of an observed race.
+
+Diagnostics contain unit states, ports, owner categories, return codes and named
+error branches. Endpoints/PIDs, raw stderr, private configuration and full logs
+are excluded. Configuration and key files are restored between scenarios and on
+exit. All scenarios finish before regression failures are returned: the current
+both-units-stopped path is expected to fail the clean-refusal/no-edits contract
+and expose traceback/ambiguous wording. The Ubuntu 24.04 job and Required may
+therefore be red. Earlier infrastructure failures can prevent these tests from
+running; no CI result has been established merely by adding this stage. Existing
+installation/rerun/reboot assertions remain mandatory after a successful stage.
+Ubuntu 26.04 retains the existing VM sequence.
+
 Limits: these VMs exercise ext4, QEMU NAT, the supplied kernel and no Pro subscription;
 they do not prove provider-specific networking or an interactive FIDO login.
 They do verify both required FIDO public identities remain accepted by OpenSSH.

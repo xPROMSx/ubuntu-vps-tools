@@ -181,23 +181,32 @@ snapshot() {
     /etc/systemd/system/apt-daily.timer.d/90-proms-schedule.conf \
     /etc/systemd/system/apt-daily-upgrade.timer.d/90-proms-schedule.conf
 }
+
+prepare_ssh_test() {
+  # Reuse the same guest-only login authority for incident tests and installation.
+  [[ -f /root/ci-login ]] || ssh-keygen -q -t ed25519 -N '' -f /root/ci-login
+  printf '#!/bin/sh\ncat /root/ci-login.pub\n' > /opt/ci/key-helper
+  chmod 700 /opt/ci/key-helper
+  printf 'AuthorizedKeysCommand /opt/ci/key-helper\nAuthorizedKeysCommandUser root\n' \
+    > /etc/ssh/sshd_config.d/99-ci-authority.conf
+  install -d -m 0755 -o root -g root /run/sshd
+  sshd -t 2>/root/ci-sshd-error || fail 'invalid test authority fixture'
+  if systemctl is-active --quiet ssh.service; then systemctl reload ssh.service; fi
+  ssh_test true >/dev/null
+}
+
 case "$stage" in
+  sshid)
+    cloud-init status --wait >/dev/null
+    apt-get update >/dev/null 2>&1 || fail 'incident package index refresh failed'
+    prepare_ssh_test
+    # Runs over an existing real SSH session, surviving a listener-only stop.
+    # Only whitelisted state diagnostics leave the guest; no raw PTY/tool logs.
+    ssh_test 'python3 /opt/ci/sshid_incident.py' || fail 'SSH incident regression failed'
+    ;;
   install)
     cloud-init status --wait >/dev/null
-    ssh-keygen -q -t ed25519 -N '' -f /root/ci-login
-    printf '#!/bin/sh\ncat /root/ci-login.pub\n' > /opt/ci/key-helper
-    chmod 700 /opt/ci/key-helper
-    printf 'AuthorizedKeysCommand /opt/ci/key-helper\nAuthorizedKeysCommandUser root\n' \
-      > /etc/ssh/sshd_config.d/99-ci-authority.conf
-    # Test fixture validates config before production ensure_sshd_runtime_dir runs.
-    install -d -m 0755 -o root -g root /run/sshd
-    if ! sshd -t 2>/root/ci-sshd-error; then
-      sed 's/^/FAIL: sshd fixture /' /root/ci-sshd-error >&2
-      fail 'invalid test authority fixture'
-    fi
-    if systemctl is-active --quiet ssh.service; then systemctl reload ssh.service; fi
-    # Readiness is already established by cloud-init; this connection is a real assertion.
-    ssh_test true >/dev/null
+    prepare_ssh_test
     cat /proc/sys/kernel/random/boot_id > /root/ci-boot-id
     [[ -z $(swapon --show=NAME --noheadings) && ! -e /swapfile && ! -L /swapfile ]]
     bootstrap initial
