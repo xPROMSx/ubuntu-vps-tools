@@ -94,13 +94,10 @@ PY
       *) return 1 ;;
     esac
   done
+  (( active )) || reasons+=('SSH-юниты не активны')
   if (( ${#reasons[@]} )); then
     printf '%s\n' "${reasons[*]}"
     return 75
-  fi
-  if (( ! active )); then
-    printf '%s\n' 'нет активного SSH-юнита'
-    return 1
   fi
 }
 
@@ -115,7 +112,12 @@ wait_system_idle() {
       message ВНИМАНИЕ "Система занята: $reason. Ждём завершения, не меняя ключи и конфигурацию SSH."
       announced=1
     fi
-    (( SECONDS < deadline )) || die 'Не дождались завершения системных работ. Подождите и запустите снова.'
+    if (( SECONDS >= deadline )); then
+      if [[ "$reason" == *'SSH-юниты не активны'* ]]; then
+        die 'SSH не запущен. Ключи и конфигурация SSH не менялись; настройка входа по паролю осталась прежней. Проверьте systemctl status ssh и systemctl status ssh.socket.'
+      fi
+      die 'Не дождались завершения системных работ. Подождите и запустите снова.'
+    fi
     delay=$((deadline - SECONDS))
     (( delay <= SYSTEM_POLL_SECONDS )) || delay=$SYSTEM_POLL_SECONDS
     sleep "$delay"

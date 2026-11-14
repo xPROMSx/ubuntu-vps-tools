@@ -133,7 +133,10 @@ system_busy
 ''', 75)
         for state in ('activating', 'deactivating', 'reloading'):
             self.run_shell(f'systemctl() {{ printf "{state}\\n"; }}; system_busy', 75)
-        self.run_shell('systemctl() { printf "inactive\\n"; }; system_busy', 1)
+        inactive = self.run_shell('systemctl() { printf "inactive\\n"; }; system_busy', 75)
+        self.assertIn('SSH-юниты не активны', inactive.stdout)
+        self.run_shell('systemctl() { printf "unrecognized\\n"; }; system_busy', 1)
+        self.run_shell('systemctl() { return 1; }; system_busy', 1)
         for state in ('done', 'disabled', 'error'):
             self.run_shell('command() { builtin command "$@"; }; '
                            + f'''cloud-init() {{ printf '{{"status":"{state}"}}'; }}; system_busy''')
@@ -180,6 +183,7 @@ main
             calls.write_text('')
             self.run_shell(f'''
 select_action() {{ NOPASS=1; }}
+SYSTEM_WAIT_SECONDS=0
 command() {{ [[ "$*" != '-v cloud-init' ]]; }}
 systemctl() {{ printf '{"active" if active else "inactive"}\\n'; }}
 flock() {{ :; }}
@@ -189,6 +193,49 @@ sshd() {{ printf 'passwordauthentication no\\n'; }}
 main
 ''', expected)
             self.assertEqual(calls.read_text(), 'keys\nhardening\n' if active else '')
+
+    def test_inactive_units_return_before_deadline(self):
+        calls = self.root / 'calls'
+        result = self.run_shell(f'''
+select_action() {{ NOPASS=1; }}
+command() {{ [[ "$*" != '-v cloud-init' ]]; }}
+echo inactive > "$STATE_DIR/unit-state"
+systemctl() {{ cat "$STATE_DIR/unit-state"; }}
+sleep() {{
+  [[ ! -e {calls} ]]
+  echo active > "$STATE_DIR/unit-state"
+}}
+flock() {{ :; }}
+update_keys() {{ echo keys >> {calls}; KEYS_CHANGED=1; }}
+harden_ssh() {{ echo hardening >> {calls}; CONFIG_CHANGED=1; }}
+sshd() {{ printf 'passwordauthentication no\\n'; }}
+main
+''')
+        self.assertEqual(calls.read_text(), 'keys\nhardening\n')
+        self.assertIn('SSH-юниты не активны', result.stderr)
+        self.assertIn('Вход по паролю: ОТКЛЮЧЁН', result.stderr)
+
+    def test_inactive_units_timeout_preserves_files(self):
+        config = self.root / 'etc/ssh/sshd_config'
+        keys = self.root / 'root/.ssh/authorized_keys'
+        config.write_text('# original config\n')
+        keys.write_text('# original keys\n')
+        result = self.run_shell('''
+select_action() { NOPASS=1; }
+SYSTEM_WAIT_SECONDS=0
+command() { [[ "$*" != '-v cloud-init' ]]; }
+systemctl() { printf 'inactive\\n'; }
+update_keys() { exit 98; }
+harden_ssh() { exit 99; }
+sshd() { printf 'passwordauthentication yes\\n'; }
+main
+''', 1)
+        self.assertEqual(config.read_text(), '# original config\n')
+        self.assertEqual(keys.read_text(), '# original keys\n')
+        for text in ('SSH не запущен', 'настройка входа по паролю осталась прежней',
+                     'systemctl status ssh', 'systemctl status ssh.socket',
+                     'Ключи SSH: не менялись', 'Конфигурация SSH: не менялась'):
+            self.assertIn(text, result.stderr)
 
     def test_runtime_activity_retry_does_not_repeat_reload(self):
         self.run_shell('''

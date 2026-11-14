@@ -126,7 +126,8 @@ rollback, preserves running APT workers, and retains recovery files on failure.
 Only menu option 2 waits before key updates: cloud-init running, POSIX/fcntl
 APT/dpkg locks or transitional SSH unit states, at most 300 seconds with 5-second
 checks. Missing cloud-init/lock files are skipped; unreadable state fails safely.
-No active SSH unit is a pre-key refusal. Preserve keys-before-hardening order.
+No active SSH unit is a wait condition in the same window; timeout refuses
+before keys and reports unchanged authentication settings. Preserve keys-before-hardening order.
 Retry only unconfirmed listeners (Python status 75) and post-reload activity,
 at most five attempts two seconds apart; never retry malformed/context errors.
 Key download uses three curl retries with a two-second delay and the same TLS limits.
