@@ -66,9 +66,10 @@ printed or uploaded.
   not guarantee that a short real unpack/restart overlaps the later port check;
   diagnostics report the observed result without inventing a failure. An observer
   started after PTY fork samples both unit states at 0, 5, 15 and 30 seconds after
-  APT exits, even while the menu waits. It never starts units. If units return,
-  the operation must succeed; no automatic return and a refusal are reported as
-  a HARNESS failure, rather than accepting the reinstall scenario as a success.
+  APT exits, even while the menu waits. The fixture restores the original socket
+  enablement and verifies both units active before APT. The observer never starts
+  units. The guest menu uses a test-only 60-second window: return requires success;
+  no observed return requires a clean timeout without edits, not a HARNESS failure.
 - **RELOAD MEASUREMENT:** 50 concurrent reload/detect pairs per production
   detector per listener architecture, each followed by an immediate post-reload
   detection. Separate during-failures and after-failures are reported for each

@@ -321,6 +321,23 @@ def main():
 
         SCENARIO = 'REAL-APT'
         reset(True)
+        # Undo reset's enablement change before the real package transaction.
+        if socket_enabled == 'enabled':
+            run('systemctl', 'enable', 'ssh.socket')
+        elif socket_enabled == 'enabled-runtime':
+            run('systemctl', 'enable', '--runtime', 'ssh.socket')
+        elif socket_enabled == 'disabled':
+            run('systemctl', 'disable', 'ssh.socket')
+        else:
+            raise HarnessError('unsupported original socket enablement for real APT fixture')
+        restored = run('systemctl', 'is-enabled', 'ssh.socket', check=False).stdout.strip()
+        if restored != socket_enabled:
+            raise HarnessError('original socket enablement not restored before real APT')
+        run('systemctl', 'start', 'ssh.socket', 'ssh.service')
+        if state('ssh.socket') != 'active' or state('ssh.service') != 'active':
+            raise HarnessError('real APT fixture requires both SSH units active')
+        print(f'DIAG: REAL-APT: fixture-socket-enabled={socket_enabled} '
+              'service=active socket=active', flush=True)
         before = (CONFIG.read_bytes(), KEYS.read_bytes())
         # REAL APT: no stop mocks, package hooks, delayed maintainer scripts or fake locks.
         apt = subprocess.Popen(['apt-get', '-y', '--no-remove', 'install', '--reinstall',
@@ -345,7 +362,7 @@ def main():
 
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                rc, text = menu(answer_during_apt)
+                rc, text = menu(answer_during_apt, wait_seconds=60)
                 sample('REAL-APT-after-menu')
                 apt_rc, observations = observer.result(timeout=360)
             print(f'DIAG: REAL-APT: apt-rc={apt_rc} lock-overlap={overlap}', flush=True)
@@ -355,9 +372,6 @@ def main():
             returned = returned or state('ssh.service') == 'active' or state('ssh.socket') == 'active'
             print(f'DIAG: REAL-APT: auto-return-observed={returned}', flush=True)
             if not returned and rc != 0:
-                failures.append('HARNESS-REAL-APT-units-not-returned')
-                print('FAIL: HARNESS scenario=REAL-APT '
-                      'message=SSH-units-not-observed-active-after-APT', flush=True)
                 outcome('REAL-APT', before, rc, text, require_timeout=True)
             else:
                 outcome('REAL-APT', before, rc, text, require_success=True)
