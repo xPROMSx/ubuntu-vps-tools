@@ -68,6 +68,8 @@ def branch(output):
         return 'connection-port-mismatch'
     if 'нет активного SSH-юнита' in output:
         return 'no-active-unit-preflight'
+    if 'SSH не запущен.' in output:
+        return 'ssh-units-timeout'
     return 'other' if ('ERROR' in output or 'ValueError' in output or '[ОШИБКА]' in output) else 'none'
 
 
@@ -106,10 +108,12 @@ detect_ssh_ports
     return run('bash', '-c', code, check=False)
 
 
-def menu(before_answer):
+def menu(before_answer, *, wait_seconds=None):
     """A controlling PTY drives the real menu/main; only curl is replaced."""
+    # Override an existing constant only in this guest test shell, after source.
+    wait_override = '' if wait_seconds is None else f'SYSTEM_WAIT_SECONDS={int(wait_seconds)}\n'
     code = f'''source {BASE / 'update-sshid'}
-curl() {{ cat {PAYLOAD}.pub; }}
+{wait_override}curl() {{ cat {PAYLOAD}.pub; }}
 main
 '''
     pid, fd = pty.fork()
@@ -183,6 +187,19 @@ def dpkg_busy():
     return False
 
 
+def observe_apt(apt):
+    apt_rc = apt.wait(timeout=300)
+    completed = time.monotonic()
+    observations = []
+    for seconds in (0, 5, 15, 30):
+        threading.Event().wait(max(0, completed + seconds - time.monotonic()))
+        service, socket = state('ssh.service'), state('ssh.socket')
+        print(f'DIAG: REAL-APT: after-apt-seconds={seconds} '
+              f'service={service} socket={socket}', flush=True)
+        observations.append((service, socket))
+    return apt_rc, observations
+
+
 def main():
     global SCENARIO
     if os.geteuid() != 0 or not (BASE / 'disposable-guest').is_file():
@@ -218,7 +235,7 @@ def main():
         if (state('ssh.socket') == 'active') != socket:
             raise HarnessError('requested listener fixture not established')
 
-    def outcome(label, before, rc, text, require_success=False):
+    def outcome(label, before, rc, text, require_success=False, require_timeout=False):
         same_config = CONFIG.read_bytes() == before[0] and not DROP.exists()
         same_keys = KEYS.read_bytes() == before[1]
         # A stopped unit can remove its RuntimeDirectory. Do not confuse that
@@ -228,17 +245,19 @@ def main():
         password = re.search(r'^passwordauthentication (yes|no)$', effective, re.M)[1]
         traceback = 'Traceback (most recent call last)' in text
         ambiguous = 'no SSH changes made' in text
+        timeout_message = 'SSH не запущен.' in text
         print(f'DIAG: {label}: menu-rc={rc} branch={branch(text)} '
               f'keys-changed={not same_keys} config-unchanged={same_config} '
               f'disk-passwordauthentication={password} traceback={traceback} '
-              f'ambiguous-message={ambiguous}', flush=True)
-        # Regression contract for phase 2: success, or clean refusal with no edits.
-        # Intentionally red on the current unconfirmed-listener failure path.
-        if traceback or ambiguous or (require_success and rc != 0) or (rc == 0 and password != 'no') or (
+              f'ambiguous-message={ambiguous} timeout-message={timeout_message}', flush=True)
+        if traceback or ambiguous or (require_success and (rc != 0 or same_keys or same_config)) or (
+                require_timeout and (rc != 1 or not timeout_message)) or (rc == 0 and password != 'no') or (
                 rc != 0 and not (same_config and same_keys)):
             failures.append(label)
+            expected = ('success-with-key-update-and-password-disabled' if require_success else
+                        'timeout-without-edits' if require_timeout else 'success-or-clean-refusal-without-edits')
             print(f'FAIL: PRODUCTION scenario={label} '
-                  'expected=success-or-clean-refusal-without-edits', flush=True)
+                  f'expected={expected}', flush=True)
 
     try:
         run('ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(PAYLOAD))
@@ -283,7 +302,22 @@ def main():
                 rc, text = menu(answer_during_stop)
                 sample(label + '-after-menu')
                 worker.result(timeout=120)
-            outcome(label, before, rc, text)
+            outcome(label, before, rc, text, require_success=True)
+
+        SCENARIO = 'SIMULATION-units-timeout'
+        reset(False)
+        before = (CONFIG.read_bytes(), KEYS.read_bytes())
+
+        def answer_without_recovery():
+            run('systemctl', 'stop', 'ssh.service', 'ssh.socket')
+            sample('SIMULATION-units-timeout-before-menu')
+
+        try:
+            rc, text = menu(answer_without_recovery, wait_seconds=2)
+            outcome(SCENARIO, before, rc, text, require_timeout=True)
+        finally:
+            # Explicit simulation cleanup, before the independent real APT test.
+            run('systemctl', 'start', 'ssh.service')
 
         SCENARIO = 'REAL-APT'
         reset(True)
@@ -294,9 +328,13 @@ def main():
                                stderr=subprocess.DEVNULL,
                                env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'})
         overlap = False
+        observer = None
 
         def answer_during_apt():
-            nonlocal overlap
+            nonlocal overlap, observer
+            # Start the observer only after PTY fork. Its clock starts at APT exit,
+            # even if the menu is still waiting; it never starts either SSH unit.
+            observer = pool.submit(observe_apt, apt)
             deadline = time.monotonic() + 30
             while apt.poll() is None and time.monotonic() < deadline:
                 if dpkg_busy():
@@ -306,13 +344,23 @@ def main():
             sample('REAL-APT-before-menu')
 
         try:
-            rc, text = menu(answer_during_apt)
-            sample('REAL-APT-after-menu')
-            apt_rc = apt.wait(timeout=300)
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                rc, text = menu(answer_during_apt)
+                sample('REAL-APT-after-menu')
+                apt_rc, observations = observer.result(timeout=360)
             print(f'DIAG: REAL-APT: apt-rc={apt_rc} lock-overlap={overlap}', flush=True)
             if apt_rc or not overlap:
                 raise HarnessError('real package transaction or lock overlap not established')
-            outcome('REAL-APT', before, rc, text)
+            returned = any('active' in states for states in observations)
+            returned = returned or state('ssh.service') == 'active' or state('ssh.socket') == 'active'
+            print(f'DIAG: REAL-APT: auto-return-observed={returned}', flush=True)
+            if not returned and rc != 0:
+                failures.append('HARNESS-REAL-APT-units-not-returned')
+                print('FAIL: HARNESS scenario=REAL-APT '
+                      'message=SSH-units-not-observed-active-after-APT', flush=True)
+                outcome('REAL-APT', before, rc, text, require_timeout=True)
+            else:
+                outcome('REAL-APT', before, rc, text, require_success=True)
         finally:
             if apt.poll() is None:
                 apt.terminate()
@@ -323,9 +371,11 @@ def main():
             label = 'reload-socket' if socket else 'reload-service'
             SCENARIO = label
             for script in ('update-sshid', 'bootstrap.sh'):
-                bad = 0
-                production_bad = 0
+                during_failures = 0
+                after_failures = 0
+                valid_after_failures = 0
                 reload_errors = 0
+                reported = False
                 for _ in range(50):
                     # Parallel reload and detection, followed by immediate post-reload detection.
                     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
@@ -336,20 +386,22 @@ def main():
                         reload_result = reloading.result(timeout=120)
                         reload_errors += bool(reload_result.returncode)
                     after = detect(script)
-                    if during.returncode or after.returncode or state('ssh.service') != 'active':
-                        bad += 1
-                        production_bad += not reload_result.returncode
-                        if bad == 1:
-                            sample(label + '-failure')
-                            print(f'DIAG: {label}: detector={script} '
-                                  f'during-branch={branch(during.stderr)} '
-                                  f'after-branch={branch(after.stderr)}', flush=True)
-                print(f'DIAG: {label}: detector={script} iterations=50 failed-pairs={bad} '
-                      f'reload-errors={reload_errors} valid-failed-pairs={production_bad}', flush=True)
-                if production_bad:
+                    during_failures += bool(during.returncode)
+                    after_failures += bool(after.returncode)
+                    valid_after_failures += bool(after.returncode and not reload_result.returncode)
+                    if (during.returncode or after.returncode) and not reported:
+                        reported = True
+                        sample(label + '-failure')
+                        print(f'DIAG: {label}: detector={script} '
+                              f'during-branch={branch(during.stderr)} '
+                              f'after-branch={branch(after.stderr)}', flush=True)
+                print(f'DIAG: {label}: detector={script} iterations=50 '
+                      f'during-failures={during_failures} after-failures={after_failures} '
+                      f'reload-errors={reload_errors} valid-after-failures={valid_after_failures}', flush=True)
+                if valid_after_failures:
                     failures.append(label + '-' + script)
                     print(f'FAIL: PRODUCTION scenario={label} detector={script} '
-                          'expected=all-detections-confirm-listeners', flush=True)
+                          'expected=post-reload-detections-confirm-listeners', flush=True)
                 if reload_errors:
                     print(f'FAIL: HARNESS scenario={label} '
                           'message=reload-command-failed-during-measurement', flush=True)

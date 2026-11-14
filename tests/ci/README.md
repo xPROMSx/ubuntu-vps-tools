@@ -53,15 +53,29 @@ printed or uploaded.
 
 - **SIMULATION:** real systemd stops for 20 seconds, first ssh.service alone with
   ssh.socket active, then both units; the units are restarted. Both production
-  detectors run during the window, followed by the real menu operation.
+  detectors run during the window, followed by the real menu operation. Both
+  cases require success with updated keys and disabled passwords after recovery.
+- **SIMULATION TIMEOUT:** both units stay stopped; the guest test shell overrides
+  SYSTEM_WAIT_SECONDS to two seconds after sourcing the unchanged production
+  script. The default production window is unchanged. Expect exit 1, unchanged
+  keys/configuration, the SSH-not-started guidance and no traceback. Units are
+  started only for explicit simulation cleanup, before the independent APT test.
 - **REAL APT:** menu option 2 runs alongside an actual openssh-server reinstall,
   without fake package commands, delayed package hooks or injected stop behavior.
   A held fcntl lock establishes package activity at menu submission. This does
   not guarantee that a short real unpack/restart overlaps the later port check;
-  diagnostics report the observed result without inventing a failure.
+  diagnostics report the observed result without inventing a failure. An observer
+  started after PTY fork samples both unit states at 0, 5, 15 and 30 seconds after
+  APT exits, even while the menu waits. It never starts units. If units return,
+  the operation must succeed; no automatic return and a refusal are reported as
+  a HARNESS failure, rather than accepting the reinstall scenario as a success.
 - **RELOAD MEASUREMENT:** 50 concurrent reload/detect pairs per production
   detector per listener architecture, each followed by an immediate post-reload
-  detection. Zero failures is a valid finding, not evidence of an observed race.
+  detection. Separate during-failures and after-failures are reported for each
+  detector. During failures are diagnostic only. Only after failures following
+  successful reload commands count as production regressions; failed reload
+  commands remain separately classified as harness failures. Zero after failures
+  is a valid finding, not evidence of an observed post-reload defect.
 - **CALM:** option 2 must succeed on settled units before the interruption tests.
 
 Diagnostics contain unit states, ports, owner categories, return codes and named
