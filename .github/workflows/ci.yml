@@ -38,6 +38,8 @@ jobs:
           bash -n update-sshid
           shellcheck update-sshid
           python3 tests/ci/test_update_sshid.py
+          python3 tests/ci/test_sshid_incident.py
+          python3 tests/ci/test_sshid_reliability.py
           # Existing baseline SC2004 is an arithmetic-index style nit only.
           shellcheck --exclude=SC2004 vps-bootstrap-ubuntu24.sh
           shellcheck tests/ci/guest.sh
@@ -75,6 +77,16 @@ jobs:
           persist-credentials: false
       - name: Install VM tooling
         run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils
+      - name: Allow the runner user to access KVM
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          else
+            echo '::warning::KVM device is absent; VM tests will use TCG'
+          fi
+          ls -l /dev/kvm 2>&1 || true
       - name: Real installation, rerun, reboot and recovery
         run: python3 tests/ci/vm.py '${{ matrix.release }}'
       - name: Sanitized diagnostics

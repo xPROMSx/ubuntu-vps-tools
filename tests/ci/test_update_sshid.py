@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory() as directory:
     personal = re.search("PERSONAL_KEY='(.*?)'", SOURCE)[1]
     payload = root / 'payload'
     payload.write_text((root/'key.pub').read_text() + personal + '\n' + personal + '\n')
-    pre = f'source {script}; chown() {{ :; }}; curl() {{ cat {payload}; }}; ' + '''install() { local args=(); while (($#)); do case $1 in -o|-g) shift 2;; *) args+=("$1"); shift;; esac; done; command install "${args[@]}"; }; '''
+    pre = f'source {script}; prepare_sshd_runtime_dir() {{ :; }}; wait_system_idle() {{ :; }}; chown() {{ :; }}; curl() {{ cat {payload}; }}; ' + '''install() { local args=(); while (($#)); do case $1 in -o|-g) shift 2;; *) args+=("$1"); shift;; esac; done; command install "${args[@]}"; }; '''
     def run(code, ok=True):
         result = subprocess.run(['bash','-c',code], capture_output=True, text=True)
         assert (result.returncode == 0) == ok, result.stderr
@@ -177,7 +177,7 @@ flock() {{ :; }}
     # A new session has neither terminal stdin nor a controlling terminal.
     no_tty = subprocess.run(['bash', '-c', menu + 'main'], input='1\n',
                             capture_output=True, text=True, start_new_session=True)
-    assert no_tty.returncode != 0 and 'Interactive terminal required' in no_tty.stderr
+    assert no_tty.returncode != 0 and 'Нужен интерактивный терминал' in no_tty.stderr
     assert calls.read_text() == ''
     for args, ok in (('--help', True), ('--nopass', False), ('--unknown', False)):
         run(menu + 'main ' + args, ok)
@@ -203,8 +203,8 @@ apply_ssh_runtime_config
         assert log.read_text().count('reload') == reloads
     config.write_text('# original\n')
     recovery = run(mock + 'NOPASS=1; apply_ssh_runtime_config() { return 1; }; harden_ssh', False)
-    assert 'recovery incomplete' in recovery.stderr
-    assert 'Keys were updated, but SSH hardening did not complete successfully' in recovery.stderr
+    assert 'Восстановление SSH не завершено' in recovery.stderr
+    assert 'Файлы восстановления сохранены' in recovery.stderr
     assert keys.read_bytes() == first
     assert config.read_text() == '# original\n'
 

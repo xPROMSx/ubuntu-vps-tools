@@ -121,6 +121,25 @@ shutdown helper, and removes persistent/runtime masks before enabling it.
 The existing apt-timers transaction verifies exact enabled/active state on
 rollback, preserves running APT workers, and retains recovery files on failure.
 
+## Standalone SSH updater reliability
+
+Only menu option 2 waits before key updates: cloud-init running, POSIX/fcntl
+APT/dpkg locks or transitional SSH unit states, at most 300 seconds with 5-second
+checks. Missing cloud-init/lock files are skipped; unreadable state fails safely.
+No active SSH unit is a wait condition in the same window; timeout refuses
+before keys and reports unchanged authentication settings. Preserve keys-before-hardening order.
+Retry only unconfirmed listeners (Python status 75) and post-reload activity,
+at most five attempts two seconds apart; never retry malformed/context errors.
+Key download uses three curl retries with a two-second delay and the same TLS limits.
+Preserve both ss flag sets. Keep sanitized diagnostics on failure, suppress
+successful ss stderr, and never publish endpoints, PIDs or key bodies.
+Both options finish with actual key/configuration state and fresh base/root SSH
+password settings. The summary prepares the runtime directory without die and
+uses unknown on failure; it is disk configuration, not proof of external access.
+Presentation flags must not change finish_update recovery decisions or exit codes.
+TTY color is disabled whenever NO_COLOR is set. Offline reliability tests do not
+prove VM behavior; harness failures are distinct from production regressions.
+
 ## CLI and subsystem reading
 
 With no arguments and TTY stdin/stdout, a one-shot menu selects the existing
@@ -164,7 +183,9 @@ system integration. Existing QEMU jobs checksum-verify official current Ubuntu
 24.04/26.04 amd64 images, run the exact PR HEAD with full upgrade, validate real
 SSH/DoT/kernel/UFW/Fail2ban/update/swap state, rerun, reboot and rerun again.
 DNS rollback injection is labelled simulation with real file/service recovery.
-KVM is used when available, otherwise TCG. These tests do not prove provider
+VM-тесты в CI всегда используют KVM, когда доступен, с явным предупреждением при откате на TCG.
+The CI udev rule grants the runner user KVM device access without changing its
+firewall, networking or services. These tests do not prove provider
 networking, XFS activation, paid Pro attachment or real FIDO authentication.
 Guest-only test SSH authority is an expected audit warning; its key is not added
 to managed authorized_keys. Only sanitized diagnostics are artifacts.

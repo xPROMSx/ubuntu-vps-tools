@@ -73,7 +73,9 @@ try:
                     str(disk), '40G'], check=True)
     files = []
     for path, source in [('/opt/ci/bootstrap.sh', ROOT / 'vps-bootstrap-ubuntu24.sh'),
-                         ('/opt/ci/guest.sh', ROOT / 'tests/ci/guest.sh')]:
+                         ('/opt/ci/guest.sh', ROOT / 'tests/ci/guest.sh'),
+                         ('/opt/ci/update-sshid', ROOT / 'update-sshid'),
+                         ('/opt/ci/sshid_incident.py', ROOT / 'tests/ci/sshid_incident.py')]:
         files.append({'path': path, 'permissions': '0700', 'encoding': 'b64',
                       'content': base64.b64encode(source.read_bytes()).decode()})
     files.extend([
@@ -95,6 +97,8 @@ try:
         reservation.bind(('127.0.0.1', 0))
         port = reservation.getsockname()[1]
     accel = 'kvm' if os.access('/dev/kvm', os.R_OK | os.W_OK) else 'tcg'
+    if accel == 'tcg':
+        record('::warning::KVM is unavailable to the runner user; falling back to TCG')
     record(f'Ubuntu {release}: accelerator={accel}; bootstrap={command("git", "rev-parse", "HEAD")}')
     serial = WORK / 'serial.sock'
     qemu = subprocess.Popen([
@@ -168,6 +172,10 @@ try:
         assert match[1] == '0', f'Guest stage {name} failed with {match[1]}'
         record(f'PASS: mandatory stage {name} completed')
 
+    # Incident evidence on the affected release, before external key-service use
+    # by the existing full installer. No production source is rewritten.
+    if release == '24.04':
+        stage('sshid', 1800)
     stage('install', 3600)
     console.sendall(b'systemctl reboot\n')
     wait_for(r'Cloud-init v.*finished', 600)
