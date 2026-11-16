@@ -193,14 +193,17 @@ CI jobs are `Basic checks`, `OpenWrt offline checks`, `Ubuntu 24.04 VM`,
 OpenWrt offline checks run `busybox ash -n openwrt/passwall2-apk-repo.sh`,
 `shellcheck -s sh openwrt/passwall2-apk-repo.sh` and
 `python3 -m unittest discover -s tests/openwrt -p 'test_*.py'`. Each VM runs
-`python3 tests/ci/vm.py` with its release argument.
+`python3 tests/ci/vm.py` with its release argument. The VM jobs run only on a
+manual `workflow_dispatch` (release `both`, `24.04` or `26.04`) or a pushed `v*`
+tag, not on pull requests or main pushes.
 
 Basic tests isolate CLI/OS validation, swap failure/idempotence simulations,
 diagnostic redaction, Pro skipping and mocked reboot scheduling. They are not
 system integration. Existing QEMU jobs checksum-verify official current Ubuntu
-24.04/26.04 amd64 images, run the exact PR HEAD with full upgrade, validate real
+24.04/26.04 amd64 images, run the exact checked-out HEAD with full upgrade, validate real
 SSH/DoT/kernel/UFW/Fail2ban/update/swap state, rerun, reboot and rerun again.
 DNS rollback injection is labelled simulation with real file/service recovery.
+Перед релизом и после изменений vps-bootstrap-ubuntu24.sh запускайте VM-тесты вручную (Actions, CI, Run workflow).
 VM-тесты в CI всегда используют KVM, когда доступен, с явным предупреждением при откате на TCG.
 The CI udev rule grants the runner user KVM device access without changing its
 firewall, networking or services. These tests do not prove provider
@@ -236,8 +239,8 @@ The checker validates only trusted full base/head SHA PR ranges (maximum 1000
 new commits), fails on shallow/missing history and redacts rejected identity
 values. Push events intentionally skip historical identity validation. Basic
 checks invoke its synthetic regression suite. Existing `CI / Required` depends
-on Basic checks, OpenWrt offline checks and both VM jobs when applicable. Only
-OpenWrt-only PRs and related documentation may skip VMs through the scope rule;
-Ubuntu/shared test/scope-rule/workflow changes and main pushes require VMs.
-Passing it is a contributor requirement, not
+only on Basic checks and OpenWrt offline checks; the VM jobs are not part of it
+and do not run on PRs or main pushes. Basic checks still run the scope rule
+`tests/openwrt/ci_scope.py`, but its `ubuntu_vm` output is no longer used by
+any job. Passing `CI / Required` is a contributor requirement, not
 a claim that repository protection currently enforces those status contexts.
