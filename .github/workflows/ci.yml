@@ -1,0 +1,118 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  basic:
+    name: Basic checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      ubuntu_vm: ${{ steps.scope.outputs.ubuntu_vm }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Validate new PR commit metadata
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 tests/ci/check_commit_metadata.py
+      - name: Determine Ubuntu VM scope
+        id: scope
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 tests/openwrt/ci_scope.py
+      - run: |
+          bash -n vps-bootstrap-ubuntu24.sh
+          bash -n tests/ci/guest.sh
+          bash -n update-sshid
+          shellcheck update-sshid
+          python3 tests/ci/test_update_sshid.py
+          python3 tests/ci/test_sshid_incident.py
+          python3 tests/ci/test_sshid_reliability.py
+          # Existing baseline SC2004 is an arithmetic-index style nit only.
+          shellcheck --exclude=SC2004 vps-bootstrap-ubuntu24.sh
+          shellcheck tests/ci/guest.sh
+          python3 tests/ci/basic.py
+          python3 tests/ci/test_commit_metadata.py
+  openwrt:
+    name: OpenWrt offline checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install shell validation tools
+        run: sudo apt-get update && sudo apt-get install -y busybox-static shellcheck
+      - run: |
+          busybox ash -n openwrt/passwall2-apk-repo.sh
+          shellcheck -s sh openwrt/passwall2-apk-repo.sh
+          python3 -m unittest discover -s tests/openwrt -p 'test_*.py'
+  vm:
+    name: Ubuntu ${{ matrix.release }} VM
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    needs: basic
+    if: needs.basic.outputs.ubuntu_vm == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['24.04', '26.04']
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+      - name: Install VM tooling
+        run: sudo apt-get update && sudo apt-get install -y qemu-system-x86 qemu-utils cloud-image-utils
+      - name: Allow the runner user to access KVM
+        run: |
+          if [ -e /dev/kvm ]; then
+            echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules >/dev/null
+            sudo udevadm control --reload-rules
+            sudo udevadm trigger --name-match=kvm
+          else
+            echo '::warning::KVM device is absent; VM tests will use TCG'
+          fi
+          ls -l /dev/kvm 2>&1 || true
+      - name: Real installation, rerun, reboot and recovery
+        run: python3 tests/ci/vm.py '${{ matrix.release }}'
+      - name: Sanitized diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diagnostics-${{ matrix.release }}
+          path: /tmp/bootstrap-ci/diagnostics.txt
+          if-no-files-found: error
+          retention-days: 7
+  required:
+    name: Required
+    if: always()
+    needs: [basic, openwrt, vm]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - env:
+          BASIC: ${{ needs.basic.result }}
+          OPENWRT: ${{ needs.openwrt.result }}
+          EXPECT_VM: ${{ needs.basic.outputs.ubuntu_vm }}
+          VM: ${{ needs.vm.result }}
+        run: |
+          test "$BASIC" = success && test "$OPENWRT" = success
+          if [ "$EXPECT_VM" = false ]; then
+            test "$VM" = skipped
+          else
+            test "$EXPECT_VM" = true && test "$VM" = success
+          fi
