@@ -1,11 +1,13 @@
 # Disposable VM integration tests
 
-`CI / Required` requires basic checks, OpenWrt offline checks and both official
-amd64 Ubuntu Cloud Image jobs when applicable. OpenWrt-only PRs and related
-documentation can skip both VMs; Ubuntu/shared test/scope-rule/workflow changes
-and every main push require them. The aggregator accepts a skipped VM only when
-the basic job explicitly reported the OpenWrt-only scope. The scope rule has
-isolated regressions in `tests/openwrt/test_ci_scope.py`.
+`CI / Required` requires only basic checks and OpenWrt offline checks. The
+official amd64 Ubuntu Cloud Image jobs do not run on pull requests or main
+pushes: they start only from a manual `workflow_dispatch` run (Actions, CI,
+Run workflow; release `both`, `24.04` or `26.04`) or from a pushed `v*` tag.
+Run them manually before a release and after changes to the installer.
+Basic checks still run the scope rule `tests/openwrt/ci_scope.py` and publish
+its `ubuntu_vm` output, but no job uses it now. The rule keeps isolated
+regressions in `tests/openwrt/test_ci_scope.py`.
 Each VM runs the exact checked-out production script with default package
 upgrade, repeats with `--no-upgrade`, reboots, verifies a changed boot ID, and
 runs the bootstrap again. Missing stages, timeout and unclassified warnings fail.
@@ -126,7 +128,8 @@ python3 tests/ci/check_commit_metadata.py --event pull_request \
 ```
 
 The check feeds the existing Required aggregation; it does not configure GitHub
-branch protection or change the VM matrix.
+branch protection or change the VM matrix. It runs on pull requests and main
+pushes, and is skipped on manual and tag runs.
 
 `OpenWrt offline checks` runs BusyBox ash syntax, ShellCheck and `tests/openwrt`
 with rewritten temporary paths and command doubles. It does not install APK

@@ -19,7 +19,7 @@ production architecture gate, and other architectures/providers are not proven.
 | `tests/openwrt/` | Offline OpenWrt and CI scope regressions. |
 | `BASELINE.md` | Immutable provenance of the original historical import. |
 | `AGENTS.md` / `CLAUDE.md` | Canonical contributor instructions and this independent Claude guide; maintain both together. |
-| `.github/workflows/ci.yml` | Basic checks, OpenWrt offline checks, two Ubuntu VM jobs and Required aggregation. |
+| `.github/workflows/ci.yml` | Basic checks, OpenWrt offline checks, two manually or tag-triggered Ubuntu VM jobs and Required aggregation. |
 | `tests/ci/README.md` | Coverage contract, diagnostics and limitations. |
 | `tests/ci/basic.py` | Isolated CLI/OS, swap, redaction, Pro and reboot regressions. |
 | `tests/ci/vm.py` | Official image verification and disposable QEMU orchestration. |
@@ -216,12 +216,15 @@ CI jobs are `Basic checks`, `OpenWrt offline checks`, `Ubuntu 24.04 VM`,
 OpenWrt offline checks run `busybox ash -n openwrt/passwall2-apk-repo.sh`,
 `shellcheck -s sh openwrt/passwall2-apk-repo.sh` and
 `python3 -m unittest discover -s tests/openwrt -p 'test_*.py'`. Each VM runs
-`python3 tests/ci/vm.py` with its release argument.
+`python3 tests/ci/vm.py` with its release argument. The VM jobs run only on a
+manual `workflow_dispatch` (release `both`, `24.04` or `26.04`) or a pushed `v*`
+tag, not on pull requests or main pushes.
 
 Keep the known production SC2004 style exclusion; other findings block CI.
 Fast tests simulate failure/idempotence, Pro skipping, diagnostic redaction and
 reboot scheduling; they do not replace system integration.
 
+Перед релизом и после изменений vps-bootstrap-ubuntu24.sh запускайте VM-тесты вручную (Actions, CI, Run workflow).
 VM-тесты в CI всегда используют KVM, когда доступен, с явным предупреждением при откате на TCG.
 The CI udev rule grants the runner user KVM device access without changing its
 firewall, networking or services.
@@ -265,9 +268,9 @@ PR metadata validation uses trusted full base/head SHAs, complete commit history
 and at most 1000 new commits; commits reachable from base are not revalidated.
 Missing/shallow history fails safely and rejected values never enter failure
 messages. Push events explicitly skip historical metadata validation; synthetic
-policy tests still run. Basic checks, OpenWrt offline checks and applicable VM
-jobs feed `CI / Required`. Only OpenWrt-only PRs and related documentation may
-skip VMs through the scope rule; Ubuntu/shared test/scope-rule/workflow changes
-and main pushes require both VMs. Require applicable checks to pass for review;
-do not assume GitHub Settings
+policy tests still run. Basic checks and OpenWrt offline checks feed
+`CI / Required`; the VM jobs are not part of it and do not run on PRs or main
+pushes. Basic checks still run the scope rule `tests/openwrt/ci_scope.py`, but
+its `ubuntu_vm` output is no longer used by any job. Require `CI / Required` to
+pass for review; do not assume GitHub Settings
 currently list those contexts as protected required checks, or change settings.
