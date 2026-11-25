@@ -142,13 +142,20 @@ jails. Do not add replacements or assume the external application jails exist.
 
 The initial no-remove dist-upgrade precedes base packages and Pro. A second
 no-remove upgrade with new packages runs only when this run enabled and confirmed
-ESM repositories. Index refreshes and autoclean remain enabled with --no-upgrade.
-Autoremove is opt-in, runs at most once after base packages and required upgrades,
-including with --no-upgrade. Keep unattended
+ESM repositories. Index refreshes and `apt-get clean` remain enabled with
+`--no-upgrade`. The periodic autoclean is unchanged. Autoremove is opt-in and
+runs at most once after base packages and required upgrades, including with
+`--no-upgrade`. Its default skip does not count as a warning. Keep unattended
 updates and update/security/ESM origins, persistent APT timers at 02:30/02:50
 Europe/Moscow with no randomized delay, default timezone Europe/Moscow and the
 04:38 unattended reboot time. Package-triggered reboot policy remains separate
 from the installer's opt-in immediate post-install scheduling.
+
+Journald uses a managed `90-proms-limits.conf` drop-in with `SystemMaxUse=128M`
+and `SystemKeepFree=1G`. Preserve existing administrator limits and storage
+mode. Restart journald only when the managed drop-in changes. Do not explicitly
+vacuum journals. The final summary includes APT cache cleanup, journald status
+and elapsed time measured after argument parsing or menu selection.
 
 Normal Ubuntu Pro setup checks attachment, can attach with a supplied token and
 enable available ESM/Livepatch services. No token on an unattached system is an
