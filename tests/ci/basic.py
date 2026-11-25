@@ -57,6 +57,78 @@ with tempfile.TemporaryDirectory() as directory:
 assert not re.search(r"^\s*set\s+-(?:[^\s]*x)", SOURCE, re.M)
 print("PASS: help, argument values, OS compatibility and trace/token canary")
 
+for elapsed, expected in ((0, '00:00'), (1471, '24:31'), (3599, '59:59'),
+                          (3600, '01:00:00'), (7541, '02:05:41')):
+    summary = run(prefix + f'SECONDS={elapsed + 100}; BOOTSTRAP_STARTED_AT=100; final_summary').stdout
+    assert f' Execution time: {expected}\n Failed checks: 0' in summary
+    assert 'Autoremove' not in summary
+print('PASS: execution time formatting at and beyond one hour')
+
+# Exercise the real policy and transactions with temporary files and systemd doubles.
+journald = re.search(r'^configure_journald\(\) \{\n.*?^\}', SOURCE, re.M | re.S).group()
+with tempfile.TemporaryDirectory() as directory:
+    path = pathlib.Path(directory)
+    dropin = path / 'journald.conf.d/90-proms-limits.conf'
+    restarts = path / 'restarts'
+    code = prefix + journald.replace('/etc/systemd/journald.conf.d/90-proms-limits.conf', str(dropin)) + r'''
+STATE_DIR=$JOURNAL_TEST_DIR
+backup_file() { :; }
+systemd-analyze() {
+  printf '# /etc/systemd/journald.conf\n%s\n' "$JOURNAL_CONFIG"
+  local dropin=$JOURNAL_TEST_DIR/journald.conf.d/90-proms-limits.conf
+  if [[ -f "$dropin" ]]; then printf '\n# %s\n' "$dropin"; cat "$dropin"; fi
+  printf '%s\n' "${JOURNAL_EXTRA:-}"
+}
+systemctl() {
+  case "$*" in
+    'restart systemd-journald')
+      printf 'restart\n' >> "$JOURNAL_TEST_DIR/restarts"
+      [[ ${FAIL_RESTART:-0} == 0 ]];;
+    'is-active --quiet systemd-journald') [[ ${SERVICE_ACTIVE:-1} == 1 ]];;
+    *) exit 99;;
+  esac
+}
+'''
+    for config, extra, expected in (
+        ('[Journal]\n  SystemMaxUse = 64M', '', 'existing limits preserved'),
+        ('[Journal]', '# /run/systemd/journald.conf.d/10-local.conf\n[Journal]\nSystemKeepFree=2G',
+         'existing limits preserved'),
+        ('[Journal]\nStorage=persistent', '# /run/systemd/journald.conf.d/95-local.conf\n[Journal]\nStorage = volatile',
+         'persistent storage disabled'),
+        ('[Journal]\nStorage=none', '', 'persistent storage disabled'),
+    ):
+        result = run(code + '\nconfigure_journald; final_summary',
+                     env={'JOURNAL_TEST_DIR': directory, 'JOURNAL_CONFIG': config, 'JOURNAL_EXTRA': extra})
+        assert re.search(r'\[i\] Journald\s+' + expected, result.stdout)
+        assert 'Warnings:      0' in result.stdout and not dropin.exists() and not restarts.exists()
+
+    env = {'JOURNAL_TEST_DIR': directory, 'JOURNAL_CONFIG': '[Journal]\n#SystemMaxUse=64M'}
+    dropin.parent.mkdir()
+    foreign = '[Journal]\nSystemMaxUse=96M\n'
+    dropin.write_text(foreign)
+    result = run(code + '\nconfigure_journald; final_summary', env=env)
+    assert '[i] Journald' in result.stdout and dropin.read_text() == foreign and not restarts.exists()
+    dropin.unlink()
+
+    result = run(code + '\nconfigure_journald; configure_journald; final_summary', env=env)
+    assert re.search(r'\[✓\] Journald\s+limit 128 MiB', result.stdout)
+    assert dropin.read_text().splitlines()[1:] == ['[Journal]', 'SystemMaxUse=128M', 'SystemKeepFree=1G']
+    assert restarts.read_text().splitlines() == ['restart']
+
+    result = run(code + '\nconfigure_journald; final_summary', env={**env, 'SERVICE_ACTIVE': '0'})
+    assert '[✗] Journald' in result.stdout and 'Failed checks: 1' in result.stdout
+    assert restarts.read_text().splitlines() == ['restart']
+
+    result = run(code + '\nconfigure_journald; final_summary',
+                 env={**env, 'JOURNAL_CONFIG': '[Journal]\nSystemMaxUse=64M'})
+    assert re.search(r'\[i\] Journald\s+existing limits preserved', result.stdout)
+    assert not dropin.exists() and restarts.read_text().splitlines() == ['restart', 'restart']
+
+    result = run(code + '\ntrap \'rc=$?; FAIL_RESTART=0; rollback_transaction; exit "$rc"\' EXIT; '
+                 'configure_journald; final_summary', env={**env, 'FAIL_RESTART': '1'}, success=False)
+    assert 'ERROR at line' in result.stderr and '[✓] Journald' not in result.stdout and not dropin.exists()
+print('PASS: journald MOCK configuration, preservation, idempotence and failed restart rollback')
+
 
 # Exercise the actual UFW pre-activation gate with mocked firewall commands.
 # This stops before the transaction; no host firewall or sysctl changes are made.
@@ -197,12 +269,14 @@ guest = (ROOT / "tests/ci/guest.sh").read_text()
 assertions = re.search(r'python3 - "/root/\$name.log" <<\'PY\'\n(.*?)\nPY', guest, re.S).group(1)
 with tempfile.TemporaryDirectory() as directory:
     fixture = pathlib.Path(directory) / "initial.log"
-    clean = 'RESULT: SUCCESS\nFull upgrade and autoclean completed\n[✓] Swap  1 GiB active; persistent\n'
+    clean = ('Full upgrade and APT cache cleanup completed\n[✓] Swap  1 GiB active; persistent\n'
+             '[✓] APT cache  cleaned\n[✓] Journald  limit 128 MiB\n'
+             ' Execution time: 24:31\n Failed checks: 0\n RESULT: SUCCESS\n')
     samples = (
         (clean, True, 'PASS: bootstrap result'),
         (clean.replace('RESULT: SUCCESS\n', ''), False, 'success RESULT assertion'),
         (clean + 'FAILED CHECK: redacted fixture\n', False, 'absence of FAILED CHECK assertion'),
-        (clean.replace('Full upgrade and autoclean completed', ''), False, 'package upgrade completion assertion'),
+        (clean.replace('Full upgrade and APT cache cleanup completed', ''), False, 'package upgrade completion assertion'),
         (clean.replace('[✓] Swap  1 GiB active; persistent',
                        '[!] Swap  skipped; creation/activation failed'), False, 'swap initial provisioning assertion'),
         (clean + 'WARN: PRIVATE_DIAG_CANARY\n', False, 'warning allowlist assertion'),
@@ -316,12 +390,19 @@ with tempfile.TemporaryDirectory() as directory:
         check_root_authorized_keys configure_swap initial_full_upgrade apt_install_base_packages
         configure_bootstrap_ipv4_fallback set_timezone configure_ubuntu_pro apt_update apt_cleanup
         check_systemd_manager configure_ssh configure_resolved configure_sysctl
-        configure_unattended_upgrades configure_ufw configure_fail2ban wait_package_manager
+        configure_unattended_upgrades configure_ufw configure_fail2ban configure_journald wait_package_manager
     '''.split())
     code = prefix + isolated + '\n' + mocks + f'''
-require_root() {{ printf 'start %s %s\n' "$CONFIGURE_PRO" "$RUN_REBOOT" >> {calls}; }}
+read() {{
+  if [[ ${{*: -1}} == choice ]]; then SECONDS=120; fi
+  builtin read "$@"
+}}
+require_root() {{
+  [[ $BOOTSTRAP_STARTED_AT -ge 60 && $((SECONDS - BOOTSTRAP_STARTED_AT)) -lt 2 ]]
+  printf 'start %s %s\n' "$CONFIGURE_PRO" "$RUN_REBOOT" >> {calls};
+}}
 final_report() {{ printf 'report\n' >> {calls}; }}
-unset NO_COLOR; TERM=xterm-256color
+unset NO_COLOR; TERM=xterm-256color; SECONDS=60
 '''
 
     def terminal(command, answer=b'', token_answer=b'\n'):
@@ -406,7 +487,7 @@ unset NO_COLOR; TERM=xterm-256color
     terminal(code + f'main > {path / "redirected"}')
     assert calls.read_text() == 'start 1 0\nreport\n'
     assert '[1-5]:' not in (path / 'redirected').read_text()
-print('PASS: bootstrap menu 1-5, flags, invalid input/EOF, single run, CLI/help bypass and non-TTY dispatch MOCKS')
+print('PASS: bootstrap menu 1-5, flags, CLI/help bypass and timer start after dispatch MOCKS')
 
 with tempfile.TemporaryDirectory() as directory:
     isolated = main.replace('/run/lock/vps-bootstrap-proms.lock', directory + '/lock')
@@ -431,7 +512,8 @@ configure_sysctl() { record sysctl; }
 configure_unattended_upgrades() { record unattended; }
 configure_ufw() { record ufw; }
 configure_fail2ban() { record fail2ban; }
-final_report() { record report; [[ ${#FAILED_CHECKS[@]} == 0 ]]; }
+configure_journald() { record journald; }
+final_report() { record report; final_summary; [[ ${#FAILED_CHECKS[@]} == 0 ]]; }
 dpkg-query() { printf 'install ok installed\n'; }
 apt-mark() { record "mark $*"; }
 apt-get() {
@@ -482,13 +564,21 @@ pro() {
         ('esm-upgrade-failure', '', '', 'upgrade', False, True),
         ('index-failure', '', '', 'update', False, False),
         ('base-failure', '', '', 'install', False, False),
-        ('cleanup-failure', '', '', 'autoclean', False, True),
+        ('autoremove-failure', '--autoremove', '', 'autoremove', False, True),
+        ('cleanup-failure', '', '', 'clean', False, True),
     ):
         path = pathlib.Path(directory) / name
         path.mkdir()
-        run(prefix + isolated + mocks + f'\nmain {args}', success=success,
-            env={'APT_TEST_DIR': str(path), 'PRO_MODE': mode, 'FAIL_APT': fail_apt,
-                 'UBUNTU_PRO_TOKEN': ''})
+        result = run(prefix + isolated + mocks + f'\nmain {args}', success=success,
+                     env={'APT_TEST_DIR': str(path), 'PRO_MODE': mode, 'FAIL_APT': fail_apt,
+                          'UBUNTU_PRO_TOKEN': ''})
+        assert 'Automatic package removal skipped' not in result.stderr
+        assert 'Autoremove' not in result.stdout
+        assert bool(re.search(r'\[✓\] APT cache\s+cleaned', result.stdout)) == (not fail_apt)
+        if name == 'nopro':
+            assert 'Warnings:      0' in result.stdout and 'RESULT: SUCCESS\n' in result.stdout
+        if '--no-upgrade' in args:
+            assert 'Package upgrades were skipped by --no-upgrade' in result.stderr
         calls = (path / 'calls').read_text().splitlines()
         apt = [c for c in calls if c.startswith('apt ')]
         expected = ([] if '--no-upgrade' in args else ['update', 'dist-upgrade'])
@@ -497,10 +587,10 @@ pro() {
             expected += ['upgrade']
         if '--autoremove' in args:
             expected += ['autoremove']
-        expected += ['autoclean']
+        expected += ['clean']
         if fail_apt:
             expected = expected[:expected.index(fail_apt) + 1]
-        kinds = ('update', 'dist-upgrade', 'install', 'upgrade', 'autoremove', 'autoclean')
+        kinds = ('update', 'dist-upgrade', 'install', 'upgrade', 'autoremove', 'clean')
         assert [next(k for k in kinds if k in c.split()) for c in apt] == expected
 
         full = [c for c in apt if ' dist-upgrade' in c]
@@ -532,18 +622,46 @@ pro() {
                     assert post_update < calls.index(extra[0])
             removals = [c for c in apt if ' autoremove ' in c]
             assert len(removals) == int('--autoremove' in args)
-            clean = next(c for c in apt if c.endswith(' autoclean'))
+            clean = next(c for c in apt if c.endswith(' clean'))
             assert apt[-1] == clean
             if removals:
                 assert calls.index(install) < calls.index(removals[0]) < calls.index(clean)
                 assert any(c.startswith('mark manual ') for c in calls[:calls.index(removals[0])])
                 if extra:
                     assert calls.index(extra[0]) < calls.index(removals[0])
-            assert calls[-8:] == ['systemd', 'ssh', 'dns', 'sysctl', 'unattended', 'ufw', 'fail2ban', 'report']
+            assert calls[-9:] == ['systemd', 'ssh', 'dns', 'sysctl', 'unattended', 'ufw', 'fail2ban', 'journald', 'report']
         else:
             assert 'report' not in calls and 'ssh' not in calls
             assert apt[-1].split().count(fail_apt) == 1
         print(f'PASS: APT/Pro MOCK {name}; order, upgrade/removal gates and errors')
+
+# A later vendor-unit repair also installs a package and needs to clean its cache.
+with tempfile.TemporaryDirectory() as directory:
+    repair = re.search(r'^ensure_apt_units\(\) \{\n.*?^\}', SOURCE, re.M | re.S).group()
+    repair = re.sub(r'/(?:usr/)?lib/systemd/system/', directory + '/', repair)
+    code = prefix + repair + r'''
+apt_run() {
+  case " $* " in
+    *' install apt '*)
+      local unit
+      for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service; do
+        printf 'unit\n' > "$APT_TEST_DIR/$unit"
+      done
+      ;;
+    *' clean '*) return "$CACHE_RC" ;;
+    *) return 99 ;;
+  esac
+}
+summary_set apt_cache ok cleaned
+ensure_apt_units
+final_summary
+'''
+    for rc, status in (('0', r'\[✓\] APT cache\s+cleaned'), ('100', r'\[✗\] APT cache\s+cleanup failed')):
+        for fixture in pathlib.Path(directory).iterdir():
+            fixture.unlink()
+        result = run(code, env={'APT_TEST_DIR': directory, 'CACHE_RC': rc})
+        assert re.search(status, result.stdout)
+print('PASS: APT cache cleanup after vendor-unit repair MOCK success and failure')
 
 # Real hidden TTY input feeding the real Pro function, with host/APT mocks above.
 with tempfile.TemporaryDirectory() as directory:
@@ -896,10 +1014,11 @@ with tempfile.TemporaryDirectory() as directory:
         ('update-lock-retry', 'apt_update', 'lists', True, 2),
         ('install-frontend-retry', 'apt_run -o DPkg::Lock::Timeout=600 -y install curl', 'frontend', True, 2),
         ('archives-two-retries', 'apt_run -o DPkg::Lock::Timeout=600 -y dist-upgrade', 'archives,archives', True, 3),
+        ('clean-archives-retry', 'apt_clean_cache', 'archives', True, 2),
         ('lock-limit', 'apt_update', 'lists,lists,lists,ok', False, 3),
         ('permanent', 'apt_update', 'release', False, 1),
         ('mixed', 'apt_update', 'mixed', False, 1),
-        ('no-apt-error', 'apt_run -y autoclean', 'silent', False, 1),
+        ('no-apt-error', 'apt_run -y clean', 'silent', False, 1),
     ):
         calls = pathlib.Path(directory) / 'calls'
         calls.write_text('')

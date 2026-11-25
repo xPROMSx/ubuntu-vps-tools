@@ -37,10 +37,11 @@ are uploaded; the failure reporter does not dump journal, tokens or key bodies.
 injected while the real production DNS transaction restores actual guest files
 and restarts the service. It is not presented as a network outage integration test.
 The fast Python suite isolates argument/OS validation; it does not claim to replace
-VM integration. Fast tests also simulate swap failures/idempotence, Pro skipping,
-reboot scheduling and diagnostic redaction. The existing production ShellCheck
-SC2004 arithmetic-index style finding is excluded explicitly; all other production findings and guest findings
-remain blocking.
+VM integration. Fast tests also cover execution time formatting, mock APT
+cleanup, autoremove and journald policy, and simulate swap failures/idempotence,
+Pro skipping, reboot scheduling and diagnostic redaction. The existing production
+ShellCheck SC2004 arithmetic-index style finding is excluded explicitly. All other
+production and guest findings remain blocking.
 
 ## SSH incident reproduction and reliability
 

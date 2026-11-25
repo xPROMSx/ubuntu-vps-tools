@@ -81,10 +81,11 @@ for read-only `check`. Keep these paths independent.
 - After key provisioning/checks/backups and swap, APT normally runs a no-remove
   dist-upgrade before base packages and Pro setup. Refresh indexes after Pro;
   run a no-remove upgrade with new packages only if ESM repositories were newly
-  enabled and confirmed during this run. Autoclean follows package work;
-  autoremove runs at most once and only by explicit opt-in, including with
-  --no-upgrade. Unattended upgrades remain
-  enabled with configured update/security/ESM origins; APT timers run at 02:30
+  enabled and confirmed during this run. `apt-get clean` clears the package cache
+  after package work, including with `--no-upgrade`. The periodic autoclean is
+  unchanged. Autoremove runs at most once by explicit opt-in, including with
+  `--no-upgrade`. Its default skip does not count as a warning. Unattended
+  upgrades remain enabled with configured update/security/ESM origins. APT timers run at 02:30
   and 02:50 Europe/Moscow, persistent and without randomized delay. The default
   timezone is Europe/Moscow and unattended reboot time is 04:38. This package
   reboot policy is separate from the installer’s opt-in `--reboot`.
@@ -103,6 +104,11 @@ for read-only `check`. Keep these paths independent.
   Incomplete recovery retains snapshots. `FAILED_CHECKS` and the existing exit
   path determine failure; summary state is presentation only. Warnings do not
   become failures merely because the colored summary displays them.
+- Journald uses a managed `90-proms-limits.conf` drop-in with `SystemMaxUse=128M`
+  and `SystemKeepFree=1G`. Preserve existing administrator limits and storage
+  mode. Restart journald only when the managed drop-in changes. Do not explicitly
+  vacuum journals. The final summary includes APT cache cleanup, journald status
+  and elapsed time measured after argument parsing or menu selection.
 - `--reboot` schedules one transient timer after successful main/final_report
   and EXIT cleanup, only with reboot-required, no errors/signals/failed checks,
   pending transaction/recovery or remaining IPv6 guard. An active fixed-name

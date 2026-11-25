@@ -33,6 +33,7 @@ CONFIGURE_SWAP=1
 CONFIGURE_PRO=1
 ESM_REPOS_ENABLED=0
 RUN_REBOOT=0
+BOOTSTRAP_STARTED_AT=0
 BOOTSTRAP_COMPLETED=0
 BOOTSTRAP_ABORTED=0
 STATE_DIR=""
@@ -383,7 +384,7 @@ rollback_transaction() {
         return 1
       fi
       ;;
-    systemd-resolved|fail2ban)
+    systemd-resolved|fail2ban|systemd-journald)
       if ! systemctl restart "$service"; then
         TX_RECOVERY_INCOMPLETE=1
         warn "Rollback incomplete: could not restart restored $service; recovery files retained in $STATE_DIR"
@@ -1150,17 +1151,18 @@ apt_cleanup() {
 
   if [[ "$RUN_AUTOREMOVE" -eq 1 ]]; then
     apt_run -o DPkg::Lock::Timeout=600 -y autoremove --purge
-    summary_set autoremove ok "completed"
-  else
-    warn "Automatic package removal skipped; use --autoremove only after reviewing apt-get -s autoremove"
-    summary_set autoremove warn "skipped by design"
   fi
-  apt_run -o DPkg::Lock::Timeout=600 -y autoclean
+  apt_clean_cache
 
   if [[ "$RUN_UPGRADE" -eq 1 ]]; then
-    pass_check "Full upgrade and autoclean completed"
+    pass_check "Full upgrade and APT cache cleanup completed"
     summary_set upgrade ok "upgrade and cleanup completed"
   fi
+}
+
+apt_clean_cache() {
+  apt_run -o DPkg::Lock::Timeout=600 clean || return $?
+  summary_set apt_cache ok "cleaned"
 }
 
 ssh_policy_ok() {
@@ -1547,6 +1549,10 @@ ensure_apt_units() {
     log "Restore missing vendor units from the apt package"
     apt_run -o DPkg::Lock::Timeout=600 -o Dpkg::Options::="--force-confold" \
       --no-remove --reinstall -y install apt || return 1
+    if ! apt_clean_cache; then
+      fail_check "APT cache cleanup failed after restoring vendor units"
+      summary_set apt_cache fail "cleanup failed after restoring vendor units"
+    fi
   fi
   for unit in apt-daily.timer apt-daily-upgrade.timer apt-daily.service apt-daily-upgrade.service; do
     [[ -s "/usr/lib/systemd/system/$unit" || -s "/lib/systemd/system/$unit" ]] || return 1
@@ -2156,6 +2162,75 @@ EOF
   fi
 }
 
+configure_journald() {
+  local dropin=/etc/systemd/journald.conf.d/90-proms-limits.conf
+  local settings config policy limits storage owned=0
+  settings='# Managed by vps-bootstrap-ubuntu24.sh
+[Journal]
+SystemMaxUse=128M
+SystemKeepFree=1G'
+
+  if [[ ! -L "${dropin%/*}" && ! -L "$dropin" && -f "$dropin" ]] &&
+     cmp -s -- "$dropin" <(printf '%s\n' "$settings"); then
+    owned=1
+  elif [[ -L "${dropin%/*}" || -L "$dropin" || -e "$dropin" ]]; then
+    summary_set journald info "existing drop-in preserved"
+    return 0
+  fi
+
+  # Follow systemd's file precedence. Check assignments in [Journal] only.
+  if ! config=$(systemd-analyze cat-config systemd/journald.conf) ||
+     ! policy=$(awk -v dropin="$dropin" '
+    BEGIN { storage = "auto"; limits = 0 }
+    /^# \/.*\/journald\.conf(\.d\/[^/]+\.conf)?$/ {
+      file = substr($0, 3)
+      if (file != dropin && file ~ /\/journald\.conf\.d\/90-proms-limits\.conf$/) limits = 1
+      section = ""; line = ""; next
+    }
+    file == dropin || /^[[:space:]]*[#;]/ { next }
+    /\\$/ { line = line substr($0, 1, length($0)-1) " "; next }
+    { $0 = line $0; line = ""; sub(/^[[:space:]]+/, ""); sub(/[[:space:]]+$/, "") }
+    /^\[/ { section = $0; next }
+    section == "[Journal]" && /^System(MaxUse|KeepFree|MaxFileSize|MaxFiles)[[:space:]]*=/ { limits = 1 }
+    section == "[Journal]" && /^Storage[[:space:]]*=/ {
+      sub(/^Storage[[:space:]]*=[[:space:]]*/, "")
+      if ($0 ~ /^(auto|persistent|volatile|none)$/) storage = $0
+    }
+    END { print limits, storage }
+  ' <<< "$config"); then
+    fail_check "Cannot inspect journald configuration"
+    summary_set journald fail "configuration could not be inspected"
+    return 0
+  fi
+  read -r limits storage <<< "$policy"
+
+  if (( limits )); then
+    if (( owned )); then
+      begin_transaction systemd-journald "$dropin"
+      rm -- "$dropin"
+      systemctl restart systemd-journald
+      commit_transaction
+    fi
+    summary_set journald info "existing limits preserved"
+  elif [[ "$storage" == volatile || "$storage" == none ]]; then
+    summary_set journald info "persistent storage disabled"
+  else
+    if (( ! owned )); then
+      install -d -m 755 -- "${dropin%/*}"
+      begin_transaction systemd-journald "$dropin"
+      printf '%s\n' "$settings" > "$dropin"
+      systemctl restart systemd-journald
+      commit_transaction
+    fi
+    if systemctl is-active --quiet systemd-journald; then
+      summary_set journald ok "limit 128 MiB"
+    else
+      fail_check "systemd-journald is not active"
+      summary_set journald fail "service is not active"
+    fi
+  fi
+}
+
 # Presentation only: never used to decide validation, rollback or exit status.
 summary_set() {
   local key="$1" state="$2" detail="${3:-}"
@@ -2171,6 +2246,7 @@ summary_set() {
 
 final_summary() {
   local key label state detail token color reset='' green='' yellow='' red='' cyan='' result
+  local elapsed=$((SECONDS - BOOTSTRAP_STARTED_AT))
   # All output is best-effort; presentation must not interrupt the existing result.
   {
     if [[ -t 1 && -z "${NO_COLOR+x}" && "${TERM:-}" != dumb ]]; then
@@ -2203,6 +2279,7 @@ final_summary() {
 os OS
 swap Swap
 upgrade System upgrade
+apt_cache APT cache
 keys SSH keys
 policy SSH policy
 authority SSH authority
@@ -2212,7 +2289,7 @@ updates Automatic updates
 ufw UFW
 fail2ban Fail2ban
 pro Ubuntu Pro
-autoremove Autoremove
+journald Journald
 reboot Reboot
 ROWS
     if [[ ${#FAILED_CHECKS[@]} -gt 0 ]]; then
@@ -2222,7 +2299,12 @@ ROWS
     else
       result=SUCCESS; color="$green"
     fi
-    printf '\n------------------------------------------------------------\n Failed checks: %s\n Warnings:      %s\n\n RESULT: %s%s%s\n============================================================\n' \
+    printf '\n------------------------------------------------------------\n Execution time: '
+    if (( elapsed >= 3600 )); then
+      printf '%02d:' "$((elapsed / 3600))"
+    fi
+    printf '%02d:%02d\n' "$((elapsed / 60 % 60))" "$((elapsed % 60))"
+    printf ' Failed checks: %s\n Warnings:      %s\n\n RESULT: %s%s%s\n============================================================\n' \
       "${#FAILED_CHECKS[@]}" "${#WARNINGS[@]}" "$color" "$result" "$reset"
   } || :
   return 0
@@ -2348,6 +2430,7 @@ main() {
   if (( $# == 0 )) && [[ -t 0 && -t 1 ]]; then
     select_bootstrap_mode || return 0
   fi
+  BOOTSTRAP_STARTED_AT=$SECONDS
   require_root
   validate_inputs
   check_os
@@ -2397,6 +2480,8 @@ main() {
   configure_ufw
   begin_stage "Fail2ban"
   configure_fail2ban
+  begin_stage "Journald"
+  configure_journald
   begin_stage "Final report"
   # An expected FAILED CHECK is not an unexpected command failure.
   if final_report; then

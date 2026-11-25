@@ -79,15 +79,20 @@ def check(condition, label):
 check('RESULT: SUCCESS WITH WARNINGS' in text or 'RESULT: SUCCESS\n' in text,
       'bootstrap success RESULT assertion')
 check('FAILED CHECK:' not in text, 'bootstrap absence of FAILED CHECK assertion')
+check(re.search(r'\[✓\] APT cache\s+cleaned', text), 'APT cache cleanup assertion')
+check(re.search(r'\[(?:✓|i)\] Journald\s+\S', text), 'journald summary assertion')
+check(re.search(r'^ Execution time: (?:[0-9]{2,}:)?[0-5][0-9]:[0-5][0-9]\n Failed checks:', text, re.M),
+      'execution time assertion')
+check(not re.search(r'^ \[[^\]]+\] Autoremove\b', text, re.M), 'absence of Autoremove summary assertion')
 if sys.argv[1].endswith('/initial.log'):
-    check('Full upgrade and autoclean completed' in text, 'default package upgrade completion assertion')
+    check('Full upgrade and APT cache cleanup completed' in text, 'default package upgrade completion assertion')
     check(re.search(r'\[✓\] Swap\s+1 GiB active; persistent', text),
           'swap initial provisioning assertion; expected [✓] 1 GiB active; persistent')
 else:
     check(re.search(r'\[i\] Swap\s+existing swap preserved', text),
           'swap rerun preservation assertion; expected [i] existing swap preserved')
 allowed=(
- 'No Ubuntu Pro token provided;', 'Automatic package removal skipped;',
+ 'No Ubuntu Pro token provided;',
  'A local key check cannot prove remote login.', 'Global DoT does not override',
  'Additional effective root SSH authority detected: authorizedkeyscommand /opt/ci/key-helper',
  'Package upgrades were skipped by --no-upgrade',
